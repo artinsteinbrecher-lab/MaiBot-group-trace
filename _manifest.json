@@ -1,0 +1,51 @@
+{
+  "manifest_version": 2,
+  "id": "github.artinsteinbrecher-lab.group-trace",
+  "version": "0.1.0",
+  "plugin_type": "data",
+  "name": "麦麦群聊寻迹",
+  "description": "根据线索检索指定群聊，并使用复合关键词持续观察相关讨论。",
+  "author": {
+    "name": "artinsteinbrecher-lab",
+    "url": "https://github.com/artinsteinbrecher-lab"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/artinsteinbrecher-lab/MaiBot-group-trace",
+    "homepage": "https://github.com/artinsteinbrecher-lab/MaiBot-group-trace",
+    "documentation": "https://github.com/artinsteinbrecher-lab/MaiBot-group-trace#readme",
+    "issues": "https://github.com/artinsteinbrecher-lab/MaiBot-group-trace/issues"
+  },
+  "host_application": {
+    "min_version": "1.1.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.7.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "llm.generate",
+    "llm.embed",
+    "chat.get_group_streams",
+    "chat.get_stream_by_group_id",
+    "chat.open_session",
+    "message.get_by_time_in_chat",
+    "message.get_by_id"
+  ],
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "scan-search"
+    }
+  },
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "i18n",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

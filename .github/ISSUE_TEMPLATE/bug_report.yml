@@ -1,0 +1,28 @@
+name: 问题反馈
+description: 报告可复现的插件问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请先删除 Token、密钥、真实 QQ 号和私人群聊内容。
+  - type: input
+    id: version
+    attributes:
+      label: 插件与 MaiBot 版本
+      placeholder: 插件 0.1.0 / MaiBot 1.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请写清发送的命令、预期结果和实际结果。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 脱敏日志
+      render: shell
+

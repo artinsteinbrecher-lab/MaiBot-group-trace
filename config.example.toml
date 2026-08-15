@@ -1,0 +1,44 @@
+[plugin]
+enabled = true
+config_version = "0.1.0"
+
+[access]
+admin_user_ids = ["你的QQ号"]
+allowed_group_ids = ["允许查询的群号"]
+notification_user_ids = []
+
+[monitoring]
+enabled = true
+max_buffer_messages = 200
+evidence_messages = 12
+semantic_verify_enabled = true
+search_on_trigger = false
+
+[retrieval]
+history_days = 30
+max_history_messages = 1200
+lexical_candidates = 100
+evidence_messages = 16
+context_radius = 2
+use_embeddings = true
+
+[models]
+intent_task = "utils"
+verify_task = "utils"
+embedding_task = "embedding"
+temperature = 0.1
+
+[search]
+enabled = false
+endpoint = ""
+api_key = ""
+authorization_header = "Authorization"
+authorization_prefix = "Bearer "
+query_parameter = "q"
+results_path = "results"
+title_field = "title"
+url_field = "url"
+snippet_field = "snippet"
+date_field = "published_at"
+timeout_seconds = 15
+max_results = 5
