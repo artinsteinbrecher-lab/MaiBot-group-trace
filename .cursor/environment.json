@@ -1,5 +1,4 @@
 {
   "name": "MaiBot group trace",
-  "install": "python3 -m pip install \"maibot-plugin-sdk>=2.7.0,<3.0.0\" ruff",
-  "start": "find /workspace -type f -not -path '*/.git/*' ! -newermt '1980-01-01' -exec touch -d '2000-01-01T00:00:00' {} + || true"
+  "install": "python3 -m pip install \"maibot-plugin-sdk>=2.7.0,<3.0.0\" ruff"
 }
