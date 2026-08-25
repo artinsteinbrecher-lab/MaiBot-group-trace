@@ -109,11 +109,12 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
                             ],
                         }
                     return {"success": True, "messages": []}
+                base = self.paging_base
                 return {
                     "success": True,
                     "messages": [
-                        self._message("m-old", "之前有人说 DSV4F 默认输出限制是 64K", timestamp="1000"),
-                        self._message("m-new", "max_tokens 需要另外配置", timestamp="1010"),
+                        self._message("m-old", "之前有人说 DSV4F 默认输出限制是 64K", timestamp=str(base)),
+                        self._message("m-new", "max_tokens 需要另外配置", timestamp=str(base + 10)),
                     ],
                 }
             if capability == "llm.generate":

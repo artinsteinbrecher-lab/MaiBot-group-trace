@@ -33,7 +33,7 @@ from .core.reporting import (
     fallback_history_answer,
     format_monitor_notification,
 )
-from .core.retrieval import expand_context, rank_lexically, rerank_with_embeddings
+from .core.retrieval import expand_context, extract_query_terms, rank_lexically, rerank_with_embeddings
 from .core.rule_engine import CompositeRuleEngine, RuleValidationError, normalize_text
 from .core.search import JsonSearchClient, SearchError, SearchSettings
 from .core.storage import StateStore
@@ -85,12 +85,19 @@ class GroupTracePlugin(MaiBotPlugin):
     )
     async def observe_group_message(self, message: Any = None, **kwargs: Any) -> None:
         del kwargs
-        if not self._ready or not self._config().plugin.enabled or not self._config().monitoring.enabled:
+        if not self._ready or not self._config().plugin.enabled:
             return
         if isinstance(message, Mapping) and bool(message.get("is_command")):
             return
         record = normalize_message(message)
         if record is None or not self._is_group_allowed(record.group_id):
+            return
+        if self._config().retrieval.local_index_enabled:
+            try:
+                await self._store.index_messages([record])
+            except Exception as exc:
+                self.ctx.logger.warning("写入本地消息索引失败：%s", exc)
+        if not self._config().monitoring.enabled:
             return
         self._engine.push(record)
 
@@ -324,20 +331,59 @@ class GroupTracePlugin(MaiBotPlugin):
             return "MaiBot 还没有建立这个群的聊天流，因此暂时无法读取该群历史消息。"
         end_time = time()
         start_time = end_time - plan.history_days * 86400
-        messages, scanned_count, scan_truncated = await self._fetch_group_window(
-            group_stream_id, start_time, end_time
-        )
-        if not messages:
-            return f"这个群最近 {plan.history_days} 天没有可供查询的文本消息。"
-
+        # 用户原文始终参与检索，模型理解结果只能补充召回、不能替换原始线索。
+        retrieval_query = " ".join([original_query, plan.search_query, *plan.keywords]).strip()
+        query_terms = extract_query_terms(retrieval_query)
         keyword_text = "、".join(plan.keywords[:8]) if plan.keywords else "（按原文匹配）"
-        scope_note = (
-            f"\n\n检索说明：理解关键词 {keyword_text}；共扫描 {scanned_count} 条消息，"
-            f"其中文本消息 {len(messages)} 条"
-            f"（{_format_time(messages[0].timestamp)} 至 {_format_time(messages[-1].timestamp)}）。"
-        )
+
+        use_index = config.retrieval.local_index_enabled and bool(query_terms)
+        scanned_count = 0
+        scan_truncated = False
+        index_hit_count = 0
+        context_pool: List[MessageRecord] | None = None
+        if use_index:
+            # 关键词直查本地索引；索引未覆盖的更早时段先分页扫描补齐
+            coverage = await self._store.index_coverage(group_id)
+            indexed_from = coverage[0] if coverage else None
+            if indexed_from is None or indexed_from > start_time:
+                gap_end = min(indexed_from, end_time) if indexed_from else end_time
+                gap_messages, scanned_count, scan_truncated = await self._fetch_group_window(
+                    group_stream_id, start_time, gap_end
+                )
+                if gap_messages:
+                    await self._store.index_messages(gap_messages)
+                    coverage = await self._store.index_coverage(group_id)
+            messages = await self._store.search_index(
+                group_id, query_terms, start_time, end_time, config.retrieval.lexical_candidates * 3
+            )
+            index_hit_count = len(messages)
+            if not messages:
+                # 关键词无直接命中时取范围内最新消息，交给语义重排兜底
+                messages = await self._store.search_index(
+                    group_id, [], start_time, end_time, config.retrieval.lexical_candidates
+                )
+            scope_note = f"\n\n检索说明：理解关键词 {keyword_text}；本地索引命中 {index_hit_count} 条"
+            if coverage:
+                scope_note += f"，索引覆盖 {_format_time(coverage[0])} 至 {_format_time(coverage[1])}"
+            if scanned_count:
+                scope_note += f"；共扫描 {scanned_count} 条消息补齐更早索引"
+            scope_note += "。"
+        else:
+            messages, scanned_count, scan_truncated = await self._fetch_group_window(
+                group_stream_id, start_time, end_time
+            )
+            scope_note = f"\n\n检索说明：理解关键词 {keyword_text}；共扫描 {scanned_count} 条消息"
+            if messages:
+                scope_note += (
+                    f"，其中文本消息 {len(messages)} 条"
+                    f"（{_format_time(messages[0].timestamp)} 至 {_format_time(messages[-1].timestamp)}）"
+                )
+            scope_note += "。"
+            context_pool = messages
         if scan_truncated:
             scope_note += "已达扫描上限，更早的消息未纳入本次检索；可在插件设置中调大“扫描消息上限”。"
+        if not messages:
+            return f"这个群最近 {plan.history_days} 天没有可供查询的文本消息。{scope_note}"
 
         if plan.excluded_terms:
             messages = [
@@ -347,9 +393,9 @@ class GroupTracePlugin(MaiBotPlugin):
             ]
         if not messages:
             return f"排除“{'、'.join(plan.excluded_terms)}”后，这个群没有剩余可查询的文本消息。{scope_note}"
+        if context_pool is not None:
+            context_pool = messages
 
-        # 用户原文始终参与检索，模型理解结果只能补充召回、不能替换原始线索。
-        retrieval_query = " ".join([original_query, plan.search_query, *plan.keywords]).strip()
         candidates = rank_lexically(retrieval_query, messages, config.retrieval.lexical_candidates)
         seed_limit = max(
             3,
@@ -370,12 +416,21 @@ class GroupTracePlugin(MaiBotPlugin):
                 self.ctx.logger.warning("嵌入语义重排失败，保留本地关键词结果：%s", exc)
         if not embedding_succeeded:
             selected = [message for message, score in candidates if score > 0][:seed_limit]
-        evidence = expand_context(
-            messages,
-            selected,
-            config.retrieval.context_radius,
-            config.retrieval.evidence_messages,
-        )
+        if context_pool is not None:
+            evidence = expand_context(
+                context_pool,
+                selected,
+                config.retrieval.context_radius,
+                config.retrieval.evidence_messages,
+            )
+        else:
+            evidence = await self._expand_context_from_index(
+                group_id,
+                selected,
+                config.retrieval.context_radius,
+                config.retrieval.evidence_messages,
+                plan.excluded_terms,
+            )
         group_name = evidence[0].group_name if evidence else f"群聊{group_id}"
         search_results = await self._search_external(plan.search_query)
         if not evidence and not search_results:
@@ -392,6 +447,26 @@ class GroupTracePlugin(MaiBotPlugin):
                 f"- {item.title}：{item.url}" for item in search_results
             )
         return (answer + scope_note + plan_note)[:14000]
+
+    async def _expand_context_from_index(
+        self,
+        group_id: str,
+        selected: Sequence[MessageRecord],
+        radius: int,
+        limit: int,
+        excluded_terms: Sequence[str] = (),
+    ) -> List[MessageRecord]:
+        """从本地索引取每条命中消息前后的对话，组装按时间排序的证据。"""
+
+        pool: Dict[str, MessageRecord] = {}
+        for seed in selected:
+            for neighbor in await self._store.index_neighbors(group_id, seed.timestamp, radius):
+                if any(normalize_text(term) in normalize_text(neighbor.text) for term in excluded_terms):
+                    continue
+                key = neighbor.message_id or f"{neighbor.timestamp}:{neighbor.user_id}"
+                pool[key] = neighbor
+        ordered = sorted(pool.values(), key=lambda item: (item.timestamp, item.message_id))
+        return expand_context(ordered, selected, radius, limit)
 
     async def _fetch_group_window(
         self, stream_id: str, start_time: float, end_time: float
@@ -552,6 +627,14 @@ class GroupTracePlugin(MaiBotPlugin):
                     max_results=config.search.max_results,
                 )
             )
+        try:
+            removed = await self._store.prune_index(
+                sorted(self._allowed_group_ids), config.retrieval.index_retention_days
+            )
+            if removed:
+                self.ctx.logger.info("已清理 %d 条过期或移出白名单群的索引消息", removed)
+        except Exception as exc:
+            self.ctx.logger.warning("清理本地消息索引失败：%s", exc)
         if not self._admin_user_ids:
             self.ctx.logger.warning("管理员 QQ 名单为空，寻迹和监控管理命令将拒绝执行")
         if not self._allowed_group_ids:

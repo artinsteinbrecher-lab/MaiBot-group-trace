@@ -22,6 +22,8 @@ lexical_candidates = 100
 evidence_messages = 16
 context_radius = 2
 use_embeddings = true
+local_index_enabled = true
+index_retention_days = 180
 
 [models]
 intent_task = "utils"

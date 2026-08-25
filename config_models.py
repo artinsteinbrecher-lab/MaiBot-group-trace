@@ -142,6 +142,18 @@ class RetrievalSection(PluginConfigBase):
         description="使用 MaiBot 已有嵌入任务进行语义重排；失败时保留本地检索结果",
         json_schema_extra={"label": "启用嵌入语义检索"},
     )
+    local_index_enabled: bool = Field(
+        default=True,
+        description="把白名单群的文本消息写入插件本地索引，寻迹时按关键词直查；索引未覆盖的更早时段自动扫描补齐",
+        json_schema_extra={"label": "启用本地关键词索引"},
+    )
+    index_retention_days: int = Field(
+        default=180,
+        ge=7,
+        le=730,
+        description="本地索引保留天数；超期消息和移出白名单群的消息会被自动清理",
+        json_schema_extra={"label": "索引保留天数"},
+    )
 
 
 class ModelSection(PluginConfigBase):
