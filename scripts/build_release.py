@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import json
+
+
+# 固定时间戳，保证发行包可复现，并避免宿主检出时留下 1980 年前的文件时间导致 zip 失败。
+ARCHIVE_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +46,11 @@ def main() -> None:
     with ZipFile(archive_path, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
         for source in files:
             relative = source.relative_to(ROOT)
-            archive.write(source, Path(PACKAGE_DIR_NAME) / relative)
+            arcname = (Path(PACKAGE_DIR_NAME) / relative).as_posix()
+            info = ZipInfo(arcname, date_time=ARCHIVE_TIMESTAMP)
+            info.compress_type = ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            archive.writestr(info, source.read_bytes())
     digest = sha256(archive_path.read_bytes()).hexdigest()
     (DIST / "SHA256SUMS.txt").write_text(f"{digest}  {archive_path.name}\n", encoding="utf-8")
     print(f"已生成 {archive_path}")
