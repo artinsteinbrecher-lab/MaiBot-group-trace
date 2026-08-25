@@ -66,6 +66,8 @@ class GroupTracePlugin(MaiBotPlugin):
         self._model_semaphore = Semaphore(2)
         self._search_client: JsonSearchClient | None = None
         self._background_tasks: Set[Task[None]] = set()
+        # 相同查询的结果缓存：key -> (过期时间, 生成时间, 回答)
+        self._answer_cache: Dict[str, Tuple[float, float, str]] = {}
         self._store = StateStore(self.ctx.paths.data_dir / "group_trace.sqlite3")
         await self._store.initialize()
         await self._refresh_runtime_state(rebuild_engine=True)
@@ -187,11 +189,27 @@ class GroupTracePlugin(MaiBotPlugin):
         return True, "寻迹任务已开始，结果将异步发送。", 2
 
     async def _search_and_send(self, stream_id: str, group_id: str, query: str) -> None:
+        cache_ttl = self._config().retrieval.answer_cache_seconds
+        cache_key = f"{group_id}|{normalize_text(query)}"
+        now = time()
+        cached = self._answer_cache.get(cache_key)
+        if cache_ttl > 0 and cached and cached[0] > now:
+            age_minutes = max(1, int((now - cached[1]) / 60))
+            answer = cached[2] + f"\n\n（相同查询的缓存结果，生成于约 {age_minutes} 分钟前）"
+            await self.ctx.send.text(answer[:14000], stream_id)
+            return
         try:
             answer = await self._search_group_history(group_id, query)
         except Exception as exc:
             self.ctx.logger.error("寻迹执行失败：%s", exc, exc_info=True)
             answer = "寻迹执行过程中出现内部错误，请稍后重试；如果反复出现请查看服务端日志。"
+        else:
+            if cache_ttl > 0:
+                if len(self._answer_cache) > 64:
+                    self._answer_cache = {
+                        key: value for key, value in self._answer_cache.items() if value[0] > now
+                    }
+                self._answer_cache[cache_key] = (now + cache_ttl, now, answer)
         sent = await self.ctx.send.text(answer[:14000], stream_id)
         if not sent:
             self.ctx.logger.error("寻迹结果发送失败：stream=%s", stream_id)
@@ -363,21 +381,42 @@ class GroupTracePlugin(MaiBotPlugin):
             return "MaiBot 还没有建立这个群的聊天流，因此暂时无法读取该群历史消息。"
         end_time = time()
         start_time = end_time - plan.history_days * 86400
-        # 用户原文始终参与检索，模型理解结果只能补充召回、不能替换原始线索。
-        retrieval_query = " ".join([original_query, plan.search_query, *plan.keywords]).strip()
-        query_terms = extract_query_terms(retrieval_query)
-        keyword_text = "、".join(plan.keywords[:8]) if plan.keywords else "（按原文匹配）"
+        # 索引直查只用用户原词和模型明确列出的别名；模型改写的整句
+        # search_query 不再参与关键词提取，避免拆出泛词污染命中统计。
+        primary_terms = extract_query_terms(original_query)
+        expansion_terms = [
+            term
+            for term in extract_query_terms(" ".join(plan.keywords))
+            if term not in primary_terms
+        ]
+        retrieval_query = " ".join([original_query, *plan.keywords]).strip()
+        primary_display = _display_terms(primary_terms)
+        expansion_display = "、".join(
+            [keyword for keyword in plan.keywords if normalize_text(keyword) not in primary_terms][:8]
+        )
 
-        use_index = config.retrieval.local_index_enabled and bool(query_terms)
+        use_index = config.retrieval.local_index_enabled and bool(primary_terms or expansion_terms)
         scanned_count = 0
         scan_truncated = False
-        index_hit_count = 0
+        primary_hit_count = 0
+        expansion_extra_count = 0
         context_pool: List[MessageRecord] | None = None
+        scope_lines: List[str] = ["———— 检索说明 ————"]
+        term_line = f"关键词（原词）：{primary_display or '（无）'}"
+        if expansion_display:
+            term_line += f"｜扩展：{expansion_display}"
+        scope_lines.append(term_line)
         if use_index:
             # 关键词直查本地索引；索引未覆盖的更早时段先分页扫描补齐
             coverage = await self._store.index_coverage(group_id)
             indexed_from = coverage[0] if coverage else None
-            if indexed_from is None or indexed_from > start_time:
+            need_scan = indexed_from is None or indexed_from > start_time
+            if need_scan:
+                scanned_until = await self._store.get_scanned_until(group_id)
+                if scanned_until is not None and scanned_until <= start_time:
+                    # 这个范围之前已完整扫描过且宿主没有更早历史，不再重复扫描
+                    need_scan = False
+            if need_scan:
                 gap_end = min(indexed_from, end_time) if indexed_from else end_time
                 gap_messages, scanned_count, scan_truncated = await self._fetch_group_window(
                     group_stream_id, start_time, gap_end
@@ -385,40 +424,53 @@ class GroupTracePlugin(MaiBotPlugin):
                 if gap_messages:
                     await self._store.index_messages(gap_messages)
                     coverage = await self._store.index_coverage(group_id)
-            raw_hits = await self._store.search_index(
-                group_id, query_terms, start_time, end_time, _INDEX_FETCH_LIMIT
+                if not scan_truncated:
+                    # 扫描自然结束（到达请求起点或宿主历史边界），记录水位
+                    await self._store.set_scanned_until(group_id, start_time)
+            primary_hits = await self._index_keyword_hits(
+                group_id, primary_terms, start_time, end_time, _INDEX_FETCH_LIMIT
             )
-            # LIKE 只保证子串出现；这里按独立词规则过滤掉英文词混在
-            # 其他字母数字串（网址、编号、chatglm 等）里的误命中。
-            messages = [
-                message for message in raw_hits if matches_any_term(normalize_text(message.text), query_terms)
+            primary_hit_count = len(primary_hits)
+            primary_ids = {message.message_id for message in primary_hits}
+            expansion_extra = [
+                message
+                for message in await self._index_keyword_hits(
+                    group_id, expansion_terms, start_time, end_time, _INDEX_FETCH_LIMIT
+                )
+                if message.message_id not in primary_ids
             ]
-            index_hit_count = len(messages)
+            expansion_extra_count = len(expansion_extra)
+            messages = sorted(
+                [*primary_hits, *expansion_extra], key=lambda item: (item.timestamp, item.message_id)
+            )
             if not messages:
                 # 关键词无直接命中时取范围内最新消息，交给语义重排兜底
                 messages = await self._store.search_index(
                     group_id, [], start_time, end_time, config.retrieval.lexical_candidates
                 )
-            scope_note = f"\n\n检索说明：理解关键词 {keyword_text}；本地索引命中 {index_hit_count} 条"
+            hits_line = f"索引命中：原词 {primary_hit_count} 条"
+            if expansion_terms:
+                hits_line += f"，扩展额外 {expansion_extra_count} 条"
+            scope_lines.append(hits_line)
             if coverage:
-                scope_note += f"，索引覆盖 {_format_time(coverage[0])} 至 {_format_time(coverage[1])}"
+                scope_lines.append(f"索引覆盖：{_format_time(coverage[0])} 至 {_format_time(coverage[1])}")
             if scanned_count:
-                scope_note += f"；共扫描 {scanned_count} 条消息补齐更早索引"
-            scope_note += "。"
+                scope_lines.append(f"本次共扫描 {scanned_count} 条消息补齐更早索引")
         else:
             messages, scanned_count, scan_truncated = await self._fetch_group_window(
                 group_stream_id, start_time, end_time
             )
-            scope_note = f"\n\n检索说明：理解关键词 {keyword_text}；共扫描 {scanned_count} 条消息"
+            scan_line = f"共扫描 {scanned_count} 条消息"
             if messages:
-                scope_note += (
+                scan_line += (
                     f"，其中文本消息 {len(messages)} 条"
                     f"（{_format_time(messages[0].timestamp)} 至 {_format_time(messages[-1].timestamp)}）"
                 )
-            scope_note += "。"
+            scope_lines.append(scan_line)
             context_pool = messages
         if scan_truncated:
-            scope_note += "已达扫描上限，更早的消息未纳入本次检索；可在插件设置中调大“扫描消息上限”。"
+            scope_lines.append("已达扫描上限，更早的消息未纳入本次检索；可在插件设置中调大“扫描消息上限”")
+        scope_note = "\n\n" + "\n".join(scope_lines)
         if not messages:
             return f"这个群最近 {plan.history_days} 天没有可供查询的文本消息。{scope_note}"
 
@@ -488,6 +540,22 @@ class GroupTracePlugin(MaiBotPlugin):
                 f"- {item.title}：{item.url}" for item in search_results
             )
         return (answer + scope_note + plan_note)[:14000]
+
+    async def _index_keyword_hits(
+        self,
+        group_id: str,
+        terms: Sequence[str],
+        start_time: float,
+        end_time: float,
+        limit: int,
+    ) -> List[MessageRecord]:
+        """索引直查加独立词过滤：LIKE 只保证子串出现，这里过滤掉英文词
+        混在其他字母数字串（网址、编号、chatglm 等）里的误命中。"""
+
+        if not terms:
+            return []
+        raw_hits = await self._store.search_index(group_id, terms, start_time, end_time, limit)
+        return [message for message in raw_hits if matches_any_term(normalize_text(message.text), terms)]
 
     async def _expand_context_from_index(
         self,
@@ -719,6 +787,13 @@ def _normalize_numeric_ids(values: Sequence[str]) -> Set[str]:
 
 def _format_time(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+
+
+def _display_terms(terms: Sequence[str]) -> str:
+    """展示检索词时只保留最长的词，隐藏它们的滑窗子片段。"""
+
+    maximal = [term for term in terms if not any(term != other and term in other for other in terms)]
+    return "、".join(maximal[:8])
 
 
 def create_plugin() -> GroupTracePlugin:

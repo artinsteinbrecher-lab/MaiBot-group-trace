@@ -122,6 +122,7 @@ def build_query_prompt(description: str, default_history_days: int) -> str:
 
 history_days 只能根据用户明确说出的时间修改，范围 1 到 365；没有时间要求时使用 {default_history_days}。
 关键词应有区分度，不要加入“这个、相关、信息、讨论”等泛词。
+keywords 只放具体的实体名、技术名和明确别名；禁止“AI模型”“软件”“工具”“内容”这类宽泛的类别词。
 """
 
 

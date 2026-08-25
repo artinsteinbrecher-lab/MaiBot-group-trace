@@ -24,6 +24,7 @@ context_radius = 2
 use_embeddings = true
 local_index_enabled = true
 index_retention_days = 180
+answer_cache_seconds = 600
 
 [models]
 intent_task = "utils"

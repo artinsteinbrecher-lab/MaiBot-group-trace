@@ -154,6 +154,13 @@ class RetrievalSection(PluginConfigBase):
         description="本地索引保留天数；超期消息和移出白名单群的消息会被自动清理",
         json_schema_extra={"label": "索引保留天数"},
     )
+    answer_cache_seconds: int = Field(
+        default=600,
+        ge=0,
+        le=86400,
+        description="相同群聊和相同线索的寻迹结果缓存时长；期间重复查询直接返回缓存，0 表示关闭",
+        json_schema_extra={"label": "相同查询缓存（秒）"},
+    )
 
 
 class ModelSection(PluginConfigBase):

@@ -102,6 +102,16 @@ class StateStore:
 
         return await asyncio.to_thread(self._prune_index_sync, list(allowed_group_ids), retention_days)
 
+    async def get_scanned_until(self, group_id: str) -> float | None:
+        """返回该群已经完整扫描到的最早时间水位，没有记录时为 None。"""
+
+        return await asyncio.to_thread(self._get_scanned_until_sync, group_id)
+
+    async def set_scanned_until(self, group_id: str, timestamp: float) -> None:
+        """记录扫描水位；只会往更早移动，避免反复扫描已到底的历史。"""
+
+        await asyncio.to_thread(self._set_scanned_until_sync, group_id, timestamp)
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=10)
         connection.row_factory = sqlite3.Row
@@ -166,6 +176,11 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_message_index_group_time
                     ON message_index(group_id, timestamp);
+
+                CREATE TABLE IF NOT EXISTS index_meta (
+                    group_id TEXT PRIMARY KEY,
+                    scanned_until REAL NOT NULL
+                );
                 """
             )
 
@@ -431,10 +446,34 @@ class StateStore:
                     f"DELETE FROM message_index WHERE group_id NOT IN ({placeholders})",
                     allowed_group_ids,
                 )
+                connection.execute(
+                    f"DELETE FROM index_meta WHERE group_id NOT IN ({placeholders})",
+                    allowed_group_ids,
+                )
             else:
                 cursor = connection.execute("DELETE FROM message_index")
+                connection.execute("DELETE FROM index_meta")
             removed += max(0, cursor.rowcount)
         return removed
+
+    def _get_scanned_until_sync(self, group_id: str) -> float | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT scanned_until FROM index_meta WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+        return float(row["scanned_until"]) if row else None
+
+    def _set_scanned_until_sync(self, group_id: str, timestamp: float) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO index_meta(group_id, scanned_until) VALUES (?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                    scanned_until = MIN(index_meta.scanned_until, excluded.scanned_until)
+                """,
+                (group_id, timestamp),
+            )
 
     @staticmethod
     def _message_from_row(row: sqlite3.Row) -> MessageRecord:

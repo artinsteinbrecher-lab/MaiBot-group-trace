@@ -99,7 +99,7 @@ def attach_evidence_footer(
 
     answer = _CITATION_PATTERN.sub(_clean_citation, answer)
     indices = sorted(cited) if cited else list(range(1, min(len(evidence), max_lines) + 1))
-    lines = [answer, "", "证据原文："]
+    lines = [answer, "", "———— 证据原文 ————"]
     for index in indices:
         lines.append(f"[E{index}] {_display_line(evidence[index - 1])}")
     return "\n".join(lines)

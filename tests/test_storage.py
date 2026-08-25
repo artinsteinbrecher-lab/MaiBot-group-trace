@@ -152,6 +152,23 @@ class MessageIndexTests(IsolatedAsyncioTestCase):
         hits = await self.store.search_index("20001", ["100%"], self.now - 3600, self.now, 10)
         self.assertEqual([item.message_id for item in hits], ["m1"])
 
+    async def test_scanned_until_moves_only_earlier(self) -> None:
+        self.assertIsNone(await self.store.get_scanned_until("20001"))
+        await self.store.set_scanned_until("20001", 5000.0)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 5000.0)
+        # 水位只往更早移动，晚的时间不覆盖早的
+        await self.store.set_scanned_until("20001", 8000.0)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 5000.0)
+        await self.store.set_scanned_until("20001", 3000.0)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 3000.0)
+
+    async def test_prune_clears_meta_of_unlisted_groups(self) -> None:
+        await self.store.set_scanned_until("20001", 1000.0)
+        await self.store.set_scanned_until("30001", 1000.0)
+        await self.store.prune_index(["20001"], 180)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 1000.0)
+        self.assertIsNone(await self.store.get_scanned_until("30001"))
+
     async def test_prune_removes_expired_and_unlisted_groups(self) -> None:
         await self.store.index_messages(
             [

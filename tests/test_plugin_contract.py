@@ -304,3 +304,33 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         # 第一页返回整整 100 条后应继续向回翻页，读到更早的相关消息
         self.assertEqual(len(fetch_calls), 2)
         self.assertIn("共扫描 102 条消息", answer)
+
+    async def test_scan_floor_prevents_rescanning_exhausted_history(self) -> None:
+        config = self.instance.get_default_config()
+        self.instance.set_plugin_config(
+            {
+                **config,
+                "access": {
+                    "admin_user_ids": ["10001"],
+                    "allowed_group_ids": ["20001"],
+                    "notification_user_ids": [],
+                },
+                # 关闭结果缓存，验证扫描水位本身能阻止重复扫描
+                "retrieval": {**config["retrieval"], "max_history_messages": 100, "answer_cache_seconds": 0},
+            }
+        )
+        await self._search_and_wait_answer()
+        await self._search_and_wait_answer()
+        fetch_calls = [
+            call
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") == "message.get_by_time_in_chat"
+        ]
+        # 第一次查询扫描两页后已到宿主历史边界；第二次不应再发起扫描
+        self.assertEqual(len(fetch_calls), 2)
+
+    async def test_identical_query_returns_cached_answer(self) -> None:
+        first = await self._search_and_wait_answer()
+        second = await self._search_and_wait_answer()
+        self.assertNotIn("缓存结果", first)
+        self.assertIn("缓存结果", second)
