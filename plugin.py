@@ -692,20 +692,29 @@ class GroupTracePlugin(MaiBotPlugin):
         return await self._generate(prompt, self._config().models.intent_task, max_tokens=1200)
 
     async def _embed_texts(self, texts: List[str]) -> Dict[str, Any]:
+        rpc_timeout_ms = self._config().models.llm_timeout_seconds * 1000
         async with self._model_semaphore:
             return await self.ctx.llm.embed(
                 texts=texts,
                 task_name=self._config().models.embedding_task,
                 max_concurrent=4,
+                # 双通道设置 RPC 等待时间：timeout_ms 由 SDK 客户端消费，
+                # rpc_timeout_ms 随能力参数传给宿主运行器；否则默认 30 秒
+                # 会中断慢渠道的在途请求。
+                timeout_ms=rpc_timeout_ms,
+                rpc_timeout_ms=rpc_timeout_ms,
             )
 
     async def _generate(self, prompt: str, task_name: str, max_tokens: int) -> Dict[str, Any]:
+        rpc_timeout_ms = self._config().models.llm_timeout_seconds * 1000
         async with self._model_semaphore:
             return await self.ctx.llm.generate(
                 prompt=prompt,
                 model=task_name.strip() or "utils",
                 temperature=self._config().models.temperature,
                 max_tokens=max_tokens,
+                timeout_ms=rpc_timeout_ms,
+                rpc_timeout_ms=rpc_timeout_ms,
             )
 
     async def _refresh_runtime_state(self, *, rebuild_engine: bool) -> None:

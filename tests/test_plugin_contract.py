@@ -281,6 +281,17 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         ]
         self.assertTrue(generation_calls)
         self.assertTrue(all(call.get("model") == "utils" for call in generation_calls))
+        # 模型调用必须显式覆盖默认 30 秒 RPC 超时：
+        # rpc_timeout_ms 随能力参数传给宿主运行器
+        self.assertTrue(all(call.get("rpc_timeout_ms") == 120000 for call in generation_calls))
+        # timeout_ms 由 SDK 客户端消费并传入 RPC 层
+        llm_rpc_timeouts = [
+            call[3]
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") in ("llm.generate", "llm.embed")
+        ]
+        self.assertTrue(llm_rpc_timeouts)
+        self.assertTrue(all(timeout == 120000 for timeout in llm_rpc_timeouts))
 
     async def test_history_search_pages_backwards_for_full_window(self) -> None:
         config = self.instance.get_default_config()

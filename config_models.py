@@ -192,6 +192,13 @@ class ModelSection(PluginConfigBase):
         description="规则解析和事实回答温度，较低更稳定",
         json_schema_extra={"label": "模型温度"},
     )
+    llm_timeout_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=600,
+        description="单次模型调用的 RPC 等待时间；慢渠道响应超过默认 30 秒会被宿主中断，此处覆盖该上限",
+        json_schema_extra={"label": "模型等待时间（秒）"},
+    )
 
 
 class SearchSection(PluginConfigBase):
