@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from asyncio import Semaphore
+from asyncio import Semaphore, Task, create_task
 from datetime import datetime
 from time import time
 from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple, cast
@@ -33,10 +33,21 @@ from .core.reporting import (
     fallback_history_answer,
     format_monitor_notification,
 )
-from .core.retrieval import expand_context, extract_query_terms, rank_lexically, rerank_with_embeddings
+from .core.retrieval import (
+    expand_context,
+    extract_query_terms,
+    matches_any_term,
+    rank_lexically,
+    rerank_with_embeddings,
+    select_diverse_seeds,
+)
 from .core.rule_engine import CompositeRuleEngine, RuleValidationError, normalize_text
 from .core.search import JsonSearchClient, SearchError, SearchSettings
 from .core.storage import StateStore
+
+
+# 关键词直查一次最多取回的候选消息数；先取回再评分，评分后才截断
+_INDEX_FETCH_LIMIT = 2000
 
 
 class GroupTracePlugin(MaiBotPlugin):
@@ -54,6 +65,7 @@ class GroupTracePlugin(MaiBotPlugin):
         self._engine = CompositeRuleEngine()
         self._model_semaphore = Semaphore(2)
         self._search_client: JsonSearchClient | None = None
+        self._background_tasks: Set[Task[None]] = set()
         self._store = StateStore(self.ctx.paths.data_dir / "group_trace.sqlite3")
         await self._store.initialize()
         await self._refresh_runtime_state(rebuild_engine=True)
@@ -67,6 +79,9 @@ class GroupTracePlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         self._ready = False
         self._rules = []
+        for task in tuple(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
         self.ctx.logger.info("麦麦群聊寻迹已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
@@ -160,9 +175,26 @@ class GroupTracePlugin(MaiBotPlugin):
                 success=False,
             )
 
-        await self.ctx.send.text("我开始查看这个群现有的历史消息，请稍等一下。", stream_id)
-        answer = await self._search_group_history(group_id, query)
-        return await self._reply(stream_id, answer, success=True)
+        await self.ctx.send.text(
+            "我开始查看这个群现有的历史消息，完成后会把结果发到这里。首次检索需要建立索引，可能需要几分钟。",
+            stream_id,
+        )
+        # 首次建索引 + 扫描 + 模型整理可能超过宿主的命令超时，
+        # 因此在后台完成检索，结果通过消息发送而不是命令返回值。
+        task = create_task(self._search_and_send(stream_id, group_id, query))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return True, "寻迹任务已开始，结果将异步发送。", 2
+
+    async def _search_and_send(self, stream_id: str, group_id: str, query: str) -> None:
+        try:
+            answer = await self._search_group_history(group_id, query)
+        except Exception as exc:
+            self.ctx.logger.error("寻迹执行失败：%s", exc, exc_info=True)
+            answer = "寻迹执行过程中出现内部错误，请稍后重试；如果反复出现请查看服务端日志。"
+        sent = await self.ctx.send.text(answer[:14000], stream_id)
+        if not sent:
+            self.ctx.logger.error("寻迹结果发送失败：stream=%s", stream_id)
 
     @Command(
         "group_trace_create_rule",
@@ -353,9 +385,14 @@ class GroupTracePlugin(MaiBotPlugin):
                 if gap_messages:
                     await self._store.index_messages(gap_messages)
                     coverage = await self._store.index_coverage(group_id)
-            messages = await self._store.search_index(
-                group_id, query_terms, start_time, end_time, config.retrieval.lexical_candidates * 3
+            raw_hits = await self._store.search_index(
+                group_id, query_terms, start_time, end_time, _INDEX_FETCH_LIMIT
             )
+            # LIKE 只保证子串出现；这里按独立词规则过滤掉英文词混在
+            # 其他字母数字串（网址、编号、chatglm 等）里的误命中。
+            messages = [
+                message for message in raw_hits if matches_any_term(normalize_text(message.text), query_terms)
+            ]
             index_hit_count = len(messages)
             if not messages:
                 # 关键词无直接命中时取范围内最新消息，交给语义重排兜底
@@ -396,26 +433,30 @@ class GroupTracePlugin(MaiBotPlugin):
         if context_pool is not None:
             context_pool = messages
 
+        # 先对全部候选评分，再截断，避免时间靠前的完整讨论被提前丢弃
         candidates = rank_lexically(retrieval_query, messages, config.retrieval.lexical_candidates)
         seed_limit = max(
             3,
-            config.retrieval.evidence_messages // max(1, config.retrieval.context_radius * 2 + 1),
+            config.retrieval.evidence_messages // max(1, config.retrieval.context_radius + 1),
         )
         selected: List[MessageRecord] = []
         embedding_succeeded = False
         if config.retrieval.use_embeddings:
             try:
-                selected = await rerank_with_embeddings(
+                reranked = await rerank_with_embeddings(
                     retrieval_query,
                     candidates,
                     self._embed_texts,
-                    seed_limit,
+                    seed_limit * 3,
                 )
+                # 按时间片段分散选证据，避免全部证据挤在同一段对话里
+                selected = select_diverse_seeds(reranked, seed_limit)
                 embedding_succeeded = True
             except Exception as exc:
                 self.ctx.logger.warning("嵌入语义重排失败，保留本地关键词结果：%s", exc)
         if not embedding_succeeded:
-            selected = [message for message, score in candidates if score > 0][:seed_limit]
+            ordered = [message for message, score in candidates if score > 0]
+            selected = select_diverse_seeds(ordered, seed_limit)
         if context_pool is not None:
             evidence = expand_context(
                 context_pool,

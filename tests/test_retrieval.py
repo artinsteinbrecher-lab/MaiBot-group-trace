@@ -35,6 +35,28 @@ class RetrievalTests(TestCase):
         self.assertEqual(ranked[0][0].message_id, "m2")
         self.assertGreater(ranked[0][1], 0)
 
+    def test_ascii_terms_require_word_boundaries(self) -> None:
+        # glm 不应匹配进 chatglm、网址或编号等其他字母数字串
+        messages = [
+            record(1, "chatglm 是另一个模型"),
+            record(2, "https://example.com/glm2024/download"),
+            record(3, "我在用 glm 写代码"),
+        ]
+        ranked = rank_lexically("glm", messages, 10)
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0][0].message_id, "m3")
+
+    def test_select_diverse_seeds_spreads_time_segments(self) -> None:
+        from core.retrieval import select_diverse_seeds
+
+        # m1、m2 属于同一时间片段，m9 是另一段；两个名额应各分一段
+        ordered = [record(1, "片段一最相关"), record(2, "片段一次相关"), record(9, "片段二")]
+        seeds = select_diverse_seeds(ordered, 2, gap_seconds=5)
+        self.assertEqual([item.message_id for item in seeds], ["m1", "m9"])
+        # 片段用尽后按相关度回填
+        filled = select_diverse_seeds(ordered, 3, gap_seconds=5)
+        self.assertEqual([item.message_id for item in filled], ["m1", "m9", "m2"])
+
     def test_query_terms_do_not_cross_connective_characters(self) -> None:
         from core.retrieval import extract_query_terms
 

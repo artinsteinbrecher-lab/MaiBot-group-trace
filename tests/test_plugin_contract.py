@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from time import time
 from unittest import IsolatedAsyncioTestCase, TestCase
 
+import asyncio
 import json
 import sys
 
@@ -246,7 +247,9 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0].excluded_terms, ["价格"])
 
-    async def test_history_search_uses_intent_embedding_and_evidence_answer(self) -> None:
+    async def _search_and_wait_answer(self) -> str:
+        """发起寻迹命令，等待后台任务完成，返回实际发送给用户的最后一条消息。"""
+
         result = await self.instance.handle_search(
             **self._command_kwargs(
                 "/寻迹 20001 找之前讨论的输出限制",
@@ -254,9 +257,20 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
             )
         )
         self.assertTrue(result[0])
-        self.assertIn("[E1]", result[1])
-        self.assertIn("检索说明", result[1])
-        self.assertIn("DSV4F", result[1])
+        await asyncio.gather(*tuple(self.instance._background_tasks))
+        sent_texts = [
+            str(call[2]["args"].get("text") or "")
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") == "send.text"
+        ]
+        self.assertTrue(sent_texts)
+        return sent_texts[-1]
+
+    async def test_history_search_uses_intent_embedding_and_evidence_answer(self) -> None:
+        answer = await self._search_and_wait_answer()
+        self.assertIn("[E1]", answer)
+        self.assertIn("检索说明", answer)
+        self.assertIn("DSV4F", answer)
         capabilities = [call[2].get("capability") for call in self.calls if isinstance(call[2], dict)]
         self.assertIn("message.get_by_time_in_chat", capabilities)
         self.assertIn("llm.embed", capabilities)
@@ -281,13 +295,7 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
                 "retrieval": {**config["retrieval"], "max_history_messages": 100},
             }
         )
-        result = await self.instance.handle_search(
-            **self._command_kwargs(
-                "/寻迹 20001 找之前讨论的输出限制",
-                {"group_id": "20001", "query": "找之前讨论的输出限制"},
-            )
-        )
-        self.assertTrue(result[0])
+        answer = await self._search_and_wait_answer()
         fetch_calls = [
             call
             for call in self.calls
@@ -295,4 +303,4 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         ]
         # 第一页返回整整 100 条后应继续向回翻页，读到更早的相关消息
         self.assertEqual(len(fetch_calls), 2)
-        self.assertIn("共扫描 102 条消息", result[1])
+        self.assertIn("共扫描 102 条消息", answer)

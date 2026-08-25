@@ -56,10 +56,20 @@ class EvidenceFooterTests(TestCase):
         self.assertIn("内容1", output)
         self.assertIn("内容2", output)
 
-    def test_footer_ignores_out_of_range_citations(self) -> None:
+    def test_footer_removes_out_of_range_citations(self) -> None:
         evidence = [record(1, "内容1", 1000.0)]
         output = attach_evidence_footer("结论 [E9]", evidence)
         self.assertIn("内容1", output)
+        # 无效编号应从回答正文中清除，不留悬空引用
+        self.assertNotIn("[E9]", output)
+
+    def test_footer_attaches_all_cited_evidence_without_cap(self) -> None:
+        evidence = [record(index, f"内容{index}", 1000.0 + index) for index in range(1, 16)]
+        answer = " ".join(f"结论{index} [E{index}]" for index in range(1, 16))
+        output = attach_evidence_footer(answer, evidence, max_lines=10)
+        # 模型引用了 15 条时应全部附原文，max_lines 只限制未标注引用的情况
+        for index in range(1, 16):
+            self.assertIn(f"[E{index}] ", output.split("证据原文：")[1])
 
     def test_footer_skipped_without_evidence(self) -> None:
         self.assertEqual(attach_evidence_footer("结论", []), "结论")

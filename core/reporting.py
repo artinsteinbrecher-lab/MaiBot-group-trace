@@ -79,16 +79,26 @@ def attach_evidence_footer(
     evidence: Sequence[MessageRecord],
     max_lines: int = 10,
 ) -> str:
-    """把回答中引用的 [En] 编号对应的原始消息附在末尾，让编号可以查证。"""
+    """清洗回答中的 [En] 引用并把对应原始消息附在末尾。
+
+    超出证据范围的编号直接从回答中移除；所有有效引用一律附原文，
+    保证不出现悬空编号。模型没有标注引用时附最多 ``max_lines`` 条证据。
+    """
 
     if not evidence:
-        return answer
+        return _CITATION_PATTERN.sub("", answer)
     cited: List[int] = []
-    for match in _CITATION_PATTERN.finditer(answer):
+
+    def _clean_citation(match: re.Match[str]) -> str:
         index = int(match.group(1))
-        if 1 <= index <= len(evidence) and index not in cited:
-            cited.append(index)
-    indices = sorted(cited)[:max_lines] if cited else list(range(1, min(len(evidence), max_lines) + 1))
+        if 1 <= index <= len(evidence):
+            if index not in cited:
+                cited.append(index)
+            return match.group(0)
+        return ""
+
+    answer = _CITATION_PATTERN.sub(_clean_citation, answer)
+    indices = sorted(cited) if cited else list(range(1, min(len(evidence), max_lines) + 1))
     lines = [answer, "", "证据原文："]
     for index in indices:
         lines.append(f"[E{index}] {_display_line(evidence[index - 1])}")

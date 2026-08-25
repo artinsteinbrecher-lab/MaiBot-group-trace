@@ -67,6 +67,55 @@ _QUERY_STOP_TERMS = {
 _CHINESE_SPLIT_CHARS = "的了和是在有就都也还把被给对与及或等吗呢吧啊呀么嘛"
 
 
+_ASCII_TERM_PATTERN = re.compile(r"[a-z0-9_+.\-]+")
+
+
+def count_term_occurrences(text: str, term: str) -> int:
+    """统计词在文本中的出现次数。
+
+    英文/数字词必须独立出现，不能是其他字母数字串的一部分
+    （避免 glm 匹配进 chatglm、网址和编号）；中文词按子串匹配。
+    """
+
+    if _ASCII_TERM_PATTERN.fullmatch(term):
+        pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+        return len(re.findall(pattern, text))
+    return text.count(term)
+
+
+def matches_any_term(text: str, terms: Sequence[str]) -> bool:
+    """判断文本是否按独立词规则命中任意一个检索词。"""
+
+    return any(count_term_occurrences(text, term) > 0 for term in terms)
+
+
+def select_diverse_seeds(
+    ordered: Sequence[MessageRecord],
+    limit: int,
+    gap_seconds: int = 1800,
+) -> List[MessageRecord]:
+    """按相关度顺序选种子，但优先覆盖不同时间片段的讨论。
+
+    先保证每个时间片段最多选一条（避免所有证据挤在同一段对话里），
+    片段用尽后再按相关度回填。
+    """
+
+    chosen: List[MessageRecord] = []
+    deferred: List[MessageRecord] = []
+    for message in ordered:
+        if len(chosen) >= limit:
+            return chosen
+        if any(abs(message.timestamp - seed.timestamp) < gap_seconds for seed in chosen):
+            deferred.append(message)
+            continue
+        chosen.append(message)
+    for message in deferred:
+        if len(chosen) >= limit:
+            break
+        chosen.append(message)
+    return chosen
+
+
 def rank_lexically(query: str, messages: Sequence[MessageRecord], limit: int) -> List[Tuple[MessageRecord, float]]:
     """使用确定性的字符/单词重叠分数召回候选消息。"""
 
@@ -80,13 +129,13 @@ def rank_lexically(query: str, messages: Sequence[MessageRecord], limit: int) ->
         if not text:
             continue
         score = 0.0
-        if normalized_query and normalized_query in text:
+        if normalized_query and count_term_occurrences(text, normalized_query) > 0:
             score += 12.0
         matched_terms: List[str] = []
         for term in query_terms:
             if any(term in longer for longer in matched_terms):
                 continue
-            occurrences = text.count(term)
+            occurrences = count_term_occurrences(text, term)
             if occurrences:
                 matched_terms.append(term)
                 score += min(4.0, 1.0 + len(term) * 0.35) * min(3, occurrences)
