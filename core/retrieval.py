@@ -62,6 +62,10 @@ _QUERY_STOP_TERMS = {
     "是否",
 }
 
+# 中文连接字和语气字：滑窗片段不应跨越这些字，否则会产生
+# “溃和”“池的”这类无意义检索词，抬高无关消息的得分。
+_CHINESE_SPLIT_CHARS = "的了和是在有就都也还把被给对与及或等吗呢吧啊呀么嘛"
+
 
 def rank_lexically(query: str, messages: Sequence[MessageRecord], limit: int) -> List[Tuple[MessageRecord, float]]:
     """使用确定性的字符/单词重叠分数召回候选消息。"""
@@ -177,11 +181,14 @@ def extract_query_terms(query: str) -> List[str]:
     for token in re.findall(r"[a-z0-9_+.-]{2,}", focused_query):
         _append_unique(output, token)
     for chinese_run in re.findall(r"[\u4e00-\u9fff]+", focused_query):
-        if 2 <= len(chinese_run) <= 8:
-            _append_unique(output, chinese_run)
-        for width in (2, 3, 4):
-            for index in range(0, max(0, len(chinese_run) - width + 1)):
-                _append_unique(output, chinese_run[index : index + width])
+        for segment in re.split(f"[{_CHINESE_SPLIT_CHARS}]", chinese_run):
+            if len(segment) < 2:
+                continue
+            if len(segment) <= 8:
+                _append_unique(output, segment)
+            for width in (2, 3, 4):
+                for index in range(0, max(0, len(segment) - width + 1)):
+                    _append_unique(output, segment[index : index + width])
     return [term for term in output if term not in _QUERY_STOP_TERMS][:80]
 
 

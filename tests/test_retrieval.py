@@ -35,6 +35,18 @@ class RetrievalTests(TestCase):
         self.assertEqual(ranked[0][0].message_id, "m2")
         self.assertGreater(ranked[0][1], 0)
 
+    def test_query_terms_do_not_cross_connective_characters(self) -> None:
+        from core.retrieval import extract_query_terms
+
+        terms = extract_query_terms("服务器崩溃和数据库连接池的讨论")
+        self.assertIn("崩溃", terms)
+        self.assertIn("数据库", terms)
+        self.assertIn("连接池", terms)
+        # 不应产生跨越“和/的”的无意义片段
+        self.assertNotIn("溃和", terms)
+        self.assertNotIn("和数", terms)
+        self.assertNotIn("池的", terms)
+
     def test_lexical_rank_does_not_double_count_subterms(self) -> None:
         # 旧实现会把“输出限制”拆出的所有 2/3 字片段重复计分，
         # 让只命中一个词组的消息压过命中多个不同关键词的消息。
