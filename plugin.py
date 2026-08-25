@@ -402,9 +402,7 @@ class GroupTracePlugin(MaiBotPlugin):
         expansion_extra_count = 0
         context_pool: List[MessageRecord] | None = None
         scope_lines: List[str] = ["———— 检索说明 ————"]
-        term_line = f"关键词（原词）：{primary_display or '（无）'}"
-        if expansion_display:
-            term_line += f"｜扩展：{expansion_display}"
+        term_line = f"关键词（原词）：{primary_display or '（无）'}｜扩展：{expansion_display or '（无）'}"
         scope_lines.append(term_line)
         if use_index:
             # 关键词直查本地索引；索引未覆盖的更早时段先分页扫描补齐
@@ -448,10 +446,10 @@ class GroupTracePlugin(MaiBotPlugin):
                 messages = await self._store.search_index(
                     group_id, [], start_time, end_time, config.retrieval.lexical_candidates
                 )
-            hits_line = f"索引命中：原词 {primary_hit_count} 条"
-            if expansion_terms:
-                hits_line += f"，扩展额外 {expansion_extra_count} 条"
-            scope_lines.append(hits_line)
+            # 无论有没有扩展词都完整显示两个数值，便于对照判断
+            scope_lines.append(
+                f"索引命中：原词 {primary_hit_count} 条，扩展额外 {expansion_extra_count} 条"
+            )
             if coverage:
                 scope_lines.append(f"索引覆盖：{_format_time(coverage[0])} 至 {_format_time(coverage[1])}")
             if scanned_count:

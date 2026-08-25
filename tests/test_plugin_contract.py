@@ -271,6 +271,9 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         self.assertIn("[E1]", answer)
         self.assertIn("检索说明", answer)
         self.assertIn("DSV4F", answer)
+        # 原词与扩展命中数无论是否为零都必须显示
+        self.assertIn("原词", answer)
+        self.assertIn("扩展额外", answer)
         capabilities = [call[2].get("capability") for call in self.calls if isinstance(call[2], dict)]
         self.assertIn("message.get_by_time_in_chat", capabilities)
         self.assertIn("llm.embed", capabilities)
