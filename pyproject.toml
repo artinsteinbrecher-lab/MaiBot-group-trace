@@ -1,6 +1,6 @@
 [project]
 name = "maibot-group-trace"
-version = "0.1.0"
+version = "0.2.0"
 description = "MaiBot 群聊线索检索与复合关键词观察插件"
 requires-python = ">=3.12"
 

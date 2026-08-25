@@ -20,7 +20,7 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用麦麦群聊寻迹"},
     )
     config_version: str = Field(
-        default="0.1.0",
+        default="0.2.0",
         description="配置结构版本，请勿手动修改",
         json_schema_extra={"label": "配置版本", "readonly": True},
     )
