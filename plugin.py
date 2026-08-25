@@ -24,8 +24,10 @@ from .core.message_utils import (
 )
 from .core.models import CompositeRule, MessageRecord, PendingRule, QueryPlan, SearchResult
 from .core.reporting import (
+    attach_evidence_footer,
     build_answer_prompt,
     build_semantic_verify_prompt,
+    fallback_history_answer,
     format_monitor_notification,
 )
 from .core.retrieval import expand_context, rank_lexically, rerank_with_embeddings
@@ -373,12 +375,9 @@ class GroupTracePlugin(MaiBotPlugin):
         prompt = build_answer_prompt(original_query, group_name, evidence, search_results)
         result = await self._generate(prompt, self._config().models.verify_task, max_tokens=2400)
         if result.get("success") and str(result.get("response") or "").strip():
-            answer = str(result["response"]).strip()
+            answer = attach_evidence_footer(str(result["response"]).strip(), evidence)
         else:
-            answer = (
-                "找到了可能相关的聊天记录，但事实整理模型暂时不可用。"
-                "为了避免把未经核验的内容当成答案，本次不直接展示候选记录，请稍后重试。"
-            )
+            answer = fallback_history_answer(original_query, group_name, evidence)
         if search_results:
             answer += "\n\n外部资料链接：\n" + "\n".join(
                 f"- {item.title}：{item.url}" for item in search_results

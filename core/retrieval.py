@@ -66,7 +66,9 @@ _QUERY_STOP_TERMS = {
 def rank_lexically(query: str, messages: Sequence[MessageRecord], limit: int) -> List[Tuple[MessageRecord, float]]:
     """使用确定性的字符/单词重叠分数召回候选消息。"""
 
-    query_terms = extract_query_terms(query)
+    # 长词优先匹配：命中长词后跳过其子片段，避免同一处文字被拆成多个
+    # 二三字滑窗重复计分，导致只含常见短词的无关消息得分虚高。
+    query_terms = sorted(extract_query_terms(query), key=len, reverse=True)
     normalized_query = normalize_text(query)
     ranked: List[Tuple[MessageRecord, float]] = []
     for message in messages:
@@ -76,10 +78,17 @@ def rank_lexically(query: str, messages: Sequence[MessageRecord], limit: int) ->
         score = 0.0
         if normalized_query and normalized_query in text:
             score += 12.0
+        matched_terms: List[str] = []
         for term in query_terms:
+            if any(term in longer for longer in matched_terms):
+                continue
             occurrences = text.count(term)
             if occurrences:
+                matched_terms.append(term)
                 score += min(4.0, 1.0 + len(term) * 0.35) * min(3, occurrences)
+        if len(matched_terms) > 1:
+            # 覆盖多个不同查询条件的消息更可信
+            score *= 1.0 + 0.15 * (len(matched_terms) - 1)
         if score > 0:
             ranked.append((message, score))
 
@@ -138,18 +147,23 @@ def expand_context(
             if message is selected_message:
                 selected_indices.append(index)
                 break
+    # selected 按相关度从高到低排列，保序去重后超限时优先保留最相关的命中。
+    seed_indices = list(dict.fromkeys(selected_indices))
     expanded_indices = set()
-    for index in selected_indices:
+    for index in seed_indices:
         expanded_indices.update(range(max(0, index - radius), min(len(all_messages), index + radius + 1)))
-    ordered = [all_messages[index] for index in sorted(expanded_indices)]
-    if len(ordered) <= limit:
-        return ordered
-
-    selected_ids = {message.message_id for message in selected if message.message_id}
-    must_keep = [message for message in ordered if message.message_id in selected_ids]
-    optional = [message for message in ordered if message.message_id not in selected_ids]
-    remaining = max(0, limit - len(must_keep))
-    return sorted((must_keep + optional[:remaining])[:limit], key=lambda item: item.timestamp)
+    if len(expanded_indices) > limit:
+        kept_seeds = seed_indices[:limit]
+        seed_set = set(kept_seeds)
+        # 裁剪时按“离最近命中消息的距离”保留上下文，而不是保留时间最早的，
+        # 否则证据会偏离真正命中的位置。
+        context_indices = sorted(
+            (index for index in expanded_indices if index not in seed_set),
+            key=lambda index: (min(abs(index - seed) for seed in seed_set), index),
+        )
+        remaining = max(0, limit - len(kept_seeds))
+        expanded_indices = seed_set | set(context_indices[:remaining])
+    return [all_messages[index] for index in sorted(expanded_indices)]
 
 
 def extract_query_terms(query: str) -> List[str]:

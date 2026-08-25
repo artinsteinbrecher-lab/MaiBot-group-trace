@@ -35,10 +35,30 @@ class RetrievalTests(TestCase):
         self.assertEqual(ranked[0][0].message_id, "m2")
         self.assertGreater(ranked[0][1], 0)
 
+    def test_lexical_rank_does_not_double_count_subterms(self) -> None:
+        # 旧实现会把“输出限制”拆出的所有 2/3 字片段重复计分，
+        # 让只命中一个词组的消息压过命中多个不同关键词的消息。
+        messages = [
+            record(1, "输出限制"),
+            record(2, "DSV4F 需要配置 64K"),
+        ]
+        ranked = rank_lexically("DSV4F 输出限制 64K", messages, 10)
+        self.assertEqual(ranked[0][0].message_id, "m2")
+
     def test_context_expansion_preserves_time_order(self) -> None:
         messages = [record(index, f"消息{index}") for index in range(8)]
         expanded = expand_context(messages, [messages[4]], radius=2, limit=10)
         self.assertEqual([item.message_id for item in expanded], ["m2", "m3", "m4", "m5", "m6"])
+
+    def test_context_trimming_keeps_messages_near_hits(self) -> None:
+        # 超出上限裁剪时应保留离命中消息最近的上下文，
+        # 而不是保留时间最早的消息导致证据位置偏移。
+        messages = [record(index, f"消息{index}") for index in range(30)]
+        expanded = expand_context(messages, [messages[20], messages[5]], radius=3, limit=9)
+        self.assertEqual(
+            [item.message_id for item in expanded],
+            ["m3", "m4", "m5", "m6", "m7", "m18", "m19", "m20", "m21"],
+        )
 
 
 class EmbeddingTests(IsolatedAsyncioTestCase):
