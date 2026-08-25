@@ -17,10 +17,12 @@ from maibot_sdk.types import EventType
 from .config_models import GroupTraceConfig
 from .core.intent_parser import IntentParseError, RuleIntentParser, extract_json_object, format_rule_draft
 from .core.message_utils import (
+    earliest_raw_timestamp,
     extract_command_identity,
     extract_payload_text,
     normalize_message,
     normalize_messages,
+    raw_message_count,
     resolve_stream_id,
 )
 from .core.models import CompositeRule, MessageRecord, PendingRule, QueryPlan, SearchResult
@@ -322,26 +324,20 @@ class GroupTracePlugin(MaiBotPlugin):
             return "MaiBot 还没有建立这个群的聊天流，因此暂时无法读取该群历史消息。"
         end_time = time()
         start_time = end_time - plan.history_days * 86400
-        raw_messages = await self.ctx.message.get_by_time_in_chat(
-            group_stream_id,
-            str(start_time),
-            str(end_time),
-            limit=config.retrieval.max_history_messages,
-            limit_mode="latest",
-            filter_mai=True,
-            filter_command=True,
+        messages, scanned_count, scan_truncated = await self._fetch_group_window(
+            group_stream_id, start_time, end_time
         )
-        messages = normalize_messages(raw_messages)
         if not messages:
             return f"这个群最近 {plan.history_days} 天没有可供查询的文本消息。"
 
         keyword_text = "、".join(plan.keywords[:8]) if plan.keywords else "（按原文匹配）"
         scope_note = (
-            f"\n\n检索说明：理解关键词 {keyword_text}；实际检索 {len(messages)} 条文本消息"
+            f"\n\n检索说明：理解关键词 {keyword_text}；共扫描 {scanned_count} 条消息，"
+            f"其中文本消息 {len(messages)} 条"
             f"（{_format_time(messages[0].timestamp)} 至 {_format_time(messages[-1].timestamp)}）。"
         )
-        if _raw_message_count(raw_messages) >= config.retrieval.max_history_messages:
-            scope_note += "已达单次读取上限，更早的消息未纳入本次检索；可在插件设置中调大“历史消息上限”。"
+        if scan_truncated:
+            scope_note += "已达扫描上限，更早的消息未纳入本次检索；可在插件设置中调大“扫描消息上限”。"
 
         if plan.excluded_terms:
             messages = [
@@ -396,6 +392,50 @@ class GroupTracePlugin(MaiBotPlugin):
                 f"- {item.title}：{item.url}" for item in search_results
             )
         return (answer + scope_note + plan_note)[:14000]
+
+    async def _fetch_group_window(
+        self, stream_id: str, start_time: float, end_time: float
+    ) -> Tuple[List[MessageRecord], int, bool]:
+        """从最新往回分页读取整个时间窗。
+
+        单次“最新 N 条”读取在高流量群中只能覆盖几个小时，更早的时间段会静默缺失。
+        返回（文本消息升序、累计扫描条数、是否因扫描上限截断）。
+        """
+
+        config = self._config().retrieval
+        page_limit = config.max_history_messages
+        scan_limit = config.scan_messages
+        collected: Dict[str, MessageRecord] = {}
+        scanned = 0
+        current_end = end_time
+        truncated = False
+        # 页数硬上限只是防御宿主异常返回导致的死循环，正常由扫描上限终止。
+        for _page in range(1000):
+            raw = await self.ctx.message.get_by_time_in_chat(
+                stream_id,
+                str(start_time),
+                str(current_end),
+                limit=page_limit,
+                limit_mode="latest",
+                filter_mai=True,
+                filter_command=True,
+            )
+            page_count = raw_message_count(raw)
+            if page_count == 0:
+                break
+            scanned += page_count
+            for record in normalize_messages(raw):
+                key = record.message_id or f"{record.timestamp}:{record.user_id}:{record.text[:40]}"
+                collected[key] = record
+            earliest = earliest_raw_timestamp(raw)
+            if page_count < page_limit or earliest is None or earliest <= start_time:
+                break
+            if scanned >= scan_limit:
+                truncated = True
+                break
+            current_end = earliest - 0.001
+        messages = sorted(collected.values(), key=lambda item: (item.timestamp, item.message_id))
+        return messages, scanned, truncated
 
     async def _semantic_verify(self, rule: CompositeRule, evidence: Sequence[MessageRecord]) -> bool:
         prompt = build_semantic_verify_prompt(rule, evidence)
@@ -551,12 +591,6 @@ class GroupTracePlugin(MaiBotPlugin):
 
 def _normalize_numeric_ids(values: Sequence[str]) -> Set[str]:
     return {str(value).strip() for value in values if str(value).strip().isdigit()}
-
-
-def _raw_message_count(raw_messages: Any) -> int:
-    if isinstance(raw_messages, Mapping):
-        raw_messages = raw_messages.get("messages") or raw_messages.get("items") or []
-    return len(raw_messages) if isinstance(raw_messages, list) else 0
 
 
 def _format_time(timestamp: float) -> str:

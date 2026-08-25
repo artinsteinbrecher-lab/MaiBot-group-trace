@@ -17,6 +17,7 @@ search_on_trigger = false
 [retrieval]
 history_days = 30
 max_history_messages = 1200
+scan_messages = 12000
 lexical_candidates = 100
 evidence_messages = 16
 context_radius = 2

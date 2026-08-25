@@ -106,8 +106,15 @@ class RetrievalSection(PluginConfigBase):
         default=1200,
         ge=100,
         le=10000,
-        description="单次从 MaiBot 读取的历史消息上限",
-        json_schema_extra={"label": "历史消息上限"},
+        description="单页从 MaiBot 读取的历史消息数量；插件会从最新往回分页扫描直到覆盖完整时间范围",
+        json_schema_extra={"label": "历史消息上限（单页）"},
+    )
+    scan_messages: int = Field(
+        default=12000,
+        ge=1000,
+        le=100000,
+        description="单次寻迹累计扫描的消息总数上限；高流量群建议调大，避免时间范围覆盖不全",
+        json_schema_extra={"label": "扫描消息上限"},
     )
     lexical_candidates: int = Field(
         default=100,

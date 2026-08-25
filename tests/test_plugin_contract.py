@@ -3,6 +3,7 @@ from __future__ import annotations
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time
 from unittest import IsolatedAsyncioTestCase, TestCase
 
 import json
@@ -70,6 +71,8 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp_dir = TemporaryDirectory()
         self.calls = []
+        self.page_calls = 0
+        self.paging_base = time() - 1000
 
         async def rpc(method, plugin_id, payload, timeout_ms=None):
             self.calls.append((method, plugin_id, payload, timeout_ms))
@@ -83,6 +86,29 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
                     "stream": {"stream_id": "group-stream", "group_id": "20001", "group_name": "模型群"},
                 }
             if capability == "message.get_by_time_in_chat":
+                if args.get("limit") == 100:
+                    # 分页模式：第一页返回整页灌水消息，第二页返回更早的相关消息
+                    self.page_calls += 1
+                    base = self.paging_base
+                    if self.page_calls == 1:
+                        return {
+                            "success": True,
+                            "messages": [
+                                self._message(f"noise-{index}", f"水群消息{index}", timestamp=str(base + index))
+                                for index in range(100)
+                            ],
+                        }
+                    if self.page_calls == 2:
+                        return {
+                            "success": True,
+                            "messages": [
+                                self._message(
+                                    "m-old", "之前有人说 DSV4F 默认输出限制是 64K", timestamp=str(base - 5000)
+                                ),
+                                self._message("m-old-2", "max_tokens 需要另外配置", timestamp=str(base - 4990)),
+                            ],
+                        }
+                    return {"success": True, "messages": []}
                 return {
                     "success": True,
                     "messages": [
@@ -240,3 +266,32 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         ]
         self.assertTrue(generation_calls)
         self.assertTrue(all(call.get("model") == "utils" for call in generation_calls))
+
+    async def test_history_search_pages_backwards_for_full_window(self) -> None:
+        config = self.instance.get_default_config()
+        self.instance.set_plugin_config(
+            {
+                **config,
+                "access": {
+                    "admin_user_ids": ["10001"],
+                    "allowed_group_ids": ["20001"],
+                    "notification_user_ids": [],
+                },
+                "retrieval": {**config["retrieval"], "max_history_messages": 100},
+            }
+        )
+        result = await self.instance.handle_search(
+            **self._command_kwargs(
+                "/寻迹 20001 找之前讨论的输出限制",
+                {"group_id": "20001", "query": "找之前讨论的输出限制"},
+            )
+        )
+        self.assertTrue(result[0])
+        fetch_calls = [
+            call
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") == "message.get_by_time_in_chat"
+        ]
+        # 第一页返回整整 100 条后应继续向回翻页，读到更早的相关消息
+        self.assertEqual(len(fetch_calls), 2)
+        self.assertIn("共扫描 102 条消息", result[1])
