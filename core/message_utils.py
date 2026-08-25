@@ -68,6 +68,29 @@ def normalize_messages(values: Any) -> List[MessageRecord]:
     return sorted(messages.values(), key=lambda item: (item.timestamp, item.message_id))
 
 
+def raw_message_count(values: Any) -> int:
+    """统计能力返回值中的原始消息条数，不要求消息含可检索文本。"""
+
+    if isinstance(values, Mapping):
+        values = values.get("messages") or values.get("items") or []
+    return len(values) if isinstance(values, list) else 0
+
+
+def earliest_raw_timestamp(values: Any) -> float | None:
+    """返回原始消息中最早的时间戳，用作向回分页的游标。"""
+
+    if isinstance(values, Mapping):
+        values = values.get("messages") or values.get("items") or []
+    if not isinstance(values, list):
+        return None
+    timestamps = [
+        parse_timestamp(value.get("timestamp"))
+        for value in values
+        if isinstance(value, Mapping)
+    ]
+    return min(timestamps) if timestamps else None
+
+
 def extract_command_identity(kwargs: Mapping[str, Any]) -> tuple[str, str]:
     """从 Command 的官方参数中提取发起用户与当前聊天流。"""
 

@@ -62,11 +62,66 @@ _QUERY_STOP_TERMS = {
     "是否",
 }
 
+# 中文连接字和语气字：滑窗片段不应跨越这些字，否则会产生
+# “溃和”“池的”这类无意义检索词，抬高无关消息的得分。
+_CHINESE_SPLIT_CHARS = "的了和是在有就都也还把被给对与及或等吗呢吧啊呀么嘛"
+
+
+_ASCII_TERM_PATTERN = re.compile(r"[a-z0-9_+.\-]+")
+
+
+def count_term_occurrences(text: str, term: str) -> int:
+    """统计词在文本中的出现次数。
+
+    英文/数字词必须独立出现，不能是其他字母数字串的一部分
+    （避免 glm 匹配进 chatglm、网址和编号）；中文词按子串匹配。
+    """
+
+    if _ASCII_TERM_PATTERN.fullmatch(term):
+        pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+        return len(re.findall(pattern, text))
+    return text.count(term)
+
+
+def matches_any_term(text: str, terms: Sequence[str]) -> bool:
+    """判断文本是否按独立词规则命中任意一个检索词。"""
+
+    return any(count_term_occurrences(text, term) > 0 for term in terms)
+
+
+def select_diverse_seeds(
+    ordered: Sequence[MessageRecord],
+    limit: int,
+    gap_seconds: int = 1800,
+) -> List[MessageRecord]:
+    """按相关度顺序选种子，但优先覆盖不同时间片段的讨论。
+
+    先保证每个时间片段最多选一条（避免所有证据挤在同一段对话里），
+    片段用尽后再按相关度回填。
+    """
+
+    chosen: List[MessageRecord] = []
+    deferred: List[MessageRecord] = []
+    for message in ordered:
+        if len(chosen) >= limit:
+            return chosen
+        if any(abs(message.timestamp - seed.timestamp) < gap_seconds for seed in chosen):
+            deferred.append(message)
+            continue
+        chosen.append(message)
+    for message in deferred:
+        if len(chosen) >= limit:
+            break
+        chosen.append(message)
+    return chosen
+
 
 def rank_lexically(query: str, messages: Sequence[MessageRecord], limit: int) -> List[Tuple[MessageRecord, float]]:
     """使用确定性的字符/单词重叠分数召回候选消息。"""
 
-    query_terms = extract_query_terms(query)
+    # 长词优先匹配：命中长词后跳过其子片段，避免同一处文字被拆成多个
+    # 二三字滑窗重复计分，导致只含常见短词的无关消息得分虚高。
+    query_terms = sorted(extract_query_terms(query), key=len, reverse=True)
     normalized_query = normalize_text(query)
     ranked: List[Tuple[MessageRecord, float]] = []
     for message in messages:
@@ -74,12 +129,19 @@ def rank_lexically(query: str, messages: Sequence[MessageRecord], limit: int) ->
         if not text:
             continue
         score = 0.0
-        if normalized_query and normalized_query in text:
+        if normalized_query and count_term_occurrences(text, normalized_query) > 0:
             score += 12.0
+        matched_terms: List[str] = []
         for term in query_terms:
-            occurrences = text.count(term)
+            if any(term in longer for longer in matched_terms):
+                continue
+            occurrences = count_term_occurrences(text, term)
             if occurrences:
+                matched_terms.append(term)
                 score += min(4.0, 1.0 + len(term) * 0.35) * min(3, occurrences)
+        if len(matched_terms) > 1:
+            # 覆盖多个不同查询条件的消息更可信
+            score *= 1.0 + 0.15 * (len(matched_terms) - 1)
         if score > 0:
             ranked.append((message, score))
 
@@ -138,18 +200,23 @@ def expand_context(
             if message is selected_message:
                 selected_indices.append(index)
                 break
+    # selected 按相关度从高到低排列，保序去重后超限时优先保留最相关的命中。
+    seed_indices = list(dict.fromkeys(selected_indices))
     expanded_indices = set()
-    for index in selected_indices:
+    for index in seed_indices:
         expanded_indices.update(range(max(0, index - radius), min(len(all_messages), index + radius + 1)))
-    ordered = [all_messages[index] for index in sorted(expanded_indices)]
-    if len(ordered) <= limit:
-        return ordered
-
-    selected_ids = {message.message_id for message in selected if message.message_id}
-    must_keep = [message for message in ordered if message.message_id in selected_ids]
-    optional = [message for message in ordered if message.message_id not in selected_ids]
-    remaining = max(0, limit - len(must_keep))
-    return sorted((must_keep + optional[:remaining])[:limit], key=lambda item: item.timestamp)
+    if len(expanded_indices) > limit:
+        kept_seeds = seed_indices[:limit]
+        seed_set = set(kept_seeds)
+        # 裁剪时按“离最近命中消息的距离”保留上下文，而不是保留时间最早的，
+        # 否则证据会偏离真正命中的位置。
+        context_indices = sorted(
+            (index for index in expanded_indices if index not in seed_set),
+            key=lambda index: (min(abs(index - seed) for seed in seed_set), index),
+        )
+        remaining = max(0, limit - len(kept_seeds))
+        expanded_indices = seed_set | set(context_indices[:remaining])
+    return [all_messages[index] for index in sorted(expanded_indices)]
 
 
 def extract_query_terms(query: str) -> List[str]:
@@ -163,11 +230,14 @@ def extract_query_terms(query: str) -> List[str]:
     for token in re.findall(r"[a-z0-9_+.-]{2,}", focused_query):
         _append_unique(output, token)
     for chinese_run in re.findall(r"[\u4e00-\u9fff]+", focused_query):
-        if 2 <= len(chinese_run) <= 8:
-            _append_unique(output, chinese_run)
-        for width in (2, 3, 4):
-            for index in range(0, max(0, len(chinese_run) - width + 1)):
-                _append_unique(output, chinese_run[index : index + width])
+        for segment in re.split(f"[{_CHINESE_SPLIT_CHARS}]", chinese_run):
+            if len(segment) < 2:
+                continue
+            if len(segment) <= 8:
+                _append_unique(output, segment)
+            for width in (2, 3, 4):
+                for index in range(0, max(0, len(segment) - width + 1)):
+                    _append_unique(output, segment[index : index + width])
     return [term for term in output if term not in _QUERY_STOP_TERMS][:80]
 
 

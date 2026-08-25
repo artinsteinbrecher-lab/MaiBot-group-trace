@@ -1,6 +1,6 @@
 [plugin]
 enabled = true
-config_version = "0.1.0"
+config_version = "0.2.0"
 
 [access]
 admin_user_ids = ["你的QQ号"]
@@ -17,16 +17,21 @@ search_on_trigger = false
 [retrieval]
 history_days = 30
 max_history_messages = 1200
+scan_messages = 12000
 lexical_candidates = 100
 evidence_messages = 16
 context_radius = 2
 use_embeddings = true
+local_index_enabled = true
+index_retention_days = 180
+answer_cache_seconds = 600
 
 [models]
 intent_task = "utils"
 verify_task = "utils"
 embedding_task = "embedding"
 temperature = 0.1
+llm_timeout_seconds = 120
 
 [search]
 enabled = false

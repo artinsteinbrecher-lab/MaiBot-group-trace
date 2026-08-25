@@ -2,10 +2,24 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time
 from unittest import IsolatedAsyncioTestCase
 
-from core.models import CompositeRule, PendingRule
+from core.models import CompositeRule, MessageRecord, PendingRule
 from core.storage import StateStore
+
+
+def make_message(index: int, text: str, timestamp: float, group_id: str = "20001") -> MessageRecord:
+    return MessageRecord(
+        message_id=f"m{index}",
+        stream_id="s",
+        group_id=group_id,
+        group_name="群",
+        user_id="u",
+        user_name="成员",
+        text=text,
+        timestamp=timestamp,
+    )
 
 
 class StorageTests(IsolatedAsyncioTestCase):
@@ -86,3 +100,85 @@ class StorageTests(IsolatedAsyncioTestCase):
         await self.store.save_pending(pending)
         self.assertIsNotNone(await self.store.pop_pending("10001"))
         self.assertIsNone(await self.store.pop_pending("10001"))
+
+
+class MessageIndexTests(IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = TemporaryDirectory()
+        self.store = StateStore(Path(self.temp_dir.name) / "state.sqlite3")
+        await self.store.initialize()
+        self.now = time()
+
+    async def asyncTearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    async def test_index_search_by_keyword(self) -> None:
+        await self.store.index_messages(
+            [
+                make_message(1, "DSV4F 输出限制是 64K", self.now - 100),
+                make_message(2, "今天吃什么", self.now - 90),
+                make_message(3, "输出限制的后续讨论", self.now - 50),
+            ]
+        )
+        hits = await self.store.search_index("20001", ["输出限制"], self.now - 3600, self.now, 10)
+        self.assertEqual([item.message_id for item in hits], ["m1", "m3"])
+        # terms 为空时返回时间范围内最新消息
+        latest = await self.store.search_index("20001", [], self.now - 3600, self.now, 2)
+        self.assertEqual([item.message_id for item in latest], ["m2", "m3"])
+
+    async def test_index_deduplicates_and_reports_coverage(self) -> None:
+        record = make_message(1, "重复消息", self.now - 10)
+        await self.store.index_messages([record])
+        await self.store.index_messages([record])
+        coverage = await self.store.index_coverage("20001")
+        self.assertIsNotNone(coverage)
+        self.assertEqual(coverage[2], 1)
+        self.assertIsNone(await self.store.index_coverage("99999"))
+
+    async def test_index_neighbors_returns_adjacent_messages(self) -> None:
+        await self.store.index_messages(
+            [make_message(index, f"消息{index}", self.now - 100 + index) for index in range(5)]
+        )
+        neighbors = await self.store.index_neighbors("20001", self.now - 100 + 2, 1)
+        self.assertEqual([item.message_id for item in neighbors], ["m1", "m2", "m3"])
+
+    async def test_index_like_wildcards_are_literal(self) -> None:
+        await self.store.index_messages(
+            [
+                make_message(1, "进度100%了", self.now - 20),
+                make_message(2, "进度100了", self.now - 10),
+            ]
+        )
+        hits = await self.store.search_index("20001", ["100%"], self.now - 3600, self.now, 10)
+        self.assertEqual([item.message_id for item in hits], ["m1"])
+
+    async def test_scanned_until_moves_only_earlier(self) -> None:
+        self.assertIsNone(await self.store.get_scanned_until("20001"))
+        await self.store.set_scanned_until("20001", 5000.0)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 5000.0)
+        # 水位只往更早移动，晚的时间不覆盖早的
+        await self.store.set_scanned_until("20001", 8000.0)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 5000.0)
+        await self.store.set_scanned_until("20001", 3000.0)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 3000.0)
+
+    async def test_prune_clears_meta_of_unlisted_groups(self) -> None:
+        await self.store.set_scanned_until("20001", 1000.0)
+        await self.store.set_scanned_until("30001", 1000.0)
+        await self.store.prune_index(["20001"], 180)
+        self.assertEqual(await self.store.get_scanned_until("20001"), 1000.0)
+        self.assertIsNone(await self.store.get_scanned_until("30001"))
+
+    async def test_prune_removes_expired_and_unlisted_groups(self) -> None:
+        await self.store.index_messages(
+            [
+                make_message(1, "过期消息", self.now - 400 * 86400),
+                make_message(2, "近期消息", self.now - 100),
+                make_message(3, "其他群消息", self.now - 100, group_id="30001"),
+            ]
+        )
+        removed = await self.store.prune_index(["20001"], 180)
+        self.assertEqual(removed, 2)
+        coverage = await self.store.index_coverage("20001")
+        self.assertEqual(coverage[2], 1)
+        self.assertIsNone(await self.store.index_coverage("30001"))

@@ -40,6 +40,20 @@ class IntentParserTests(IsolatedAsyncioTestCase):
         self.assertEqual(plan.history_days, 365)
         self.assertEqual(plan.keywords, ["DSV4F"])
 
+    async def test_query_plan_drops_hallucinated_excluded_terms(self) -> None:
+        async def generate(_prompt: str):
+            return {
+                "success": True,
+                "response": (
+                    '{"search_query":"DSV4F 输出限制","keywords":["DSV4F"],'
+                    '"excluded_terms":["价格","报错"],"history_days":30}'
+                ),
+            }
+
+        plan = await RuleIntentParser(generate).parse_query("找 DSV4F 输出限制的讨论，价格不用管", 30)
+        # “价格”在用户原话中出现过，保留；“报错”是模型编造的，丢弃。
+        self.assertEqual(plan.excluded_terms, ["价格"])
+
 
 class JsonExtractionTests(TestCase):
     def test_markdown_fence_is_accepted(self) -> None:

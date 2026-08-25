@@ -3,8 +3,10 @@ from __future__ import annotations
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time
 from unittest import IsolatedAsyncioTestCase, TestCase
 
+import asyncio
 import json
 import sys
 
@@ -70,6 +72,8 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp_dir = TemporaryDirectory()
         self.calls = []
+        self.page_calls = 0
+        self.paging_base = time() - 1000
 
         async def rpc(method, plugin_id, payload, timeout_ms=None):
             self.calls.append((method, plugin_id, payload, timeout_ms))
@@ -83,11 +87,35 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
                     "stream": {"stream_id": "group-stream", "group_id": "20001", "group_name": "模型群"},
                 }
             if capability == "message.get_by_time_in_chat":
+                if args.get("limit") == 100:
+                    # 分页模式：第一页返回整页灌水消息，第二页返回更早的相关消息
+                    self.page_calls += 1
+                    base = self.paging_base
+                    if self.page_calls == 1:
+                        return {
+                            "success": True,
+                            "messages": [
+                                self._message(f"noise-{index}", f"水群消息{index}", timestamp=str(base + index))
+                                for index in range(100)
+                            ],
+                        }
+                    if self.page_calls == 2:
+                        return {
+                            "success": True,
+                            "messages": [
+                                self._message(
+                                    "m-old", "之前有人说 DSV4F 默认输出限制是 64K", timestamp=str(base - 5000)
+                                ),
+                                self._message("m-old-2", "max_tokens 需要另外配置", timestamp=str(base - 4990)),
+                            ],
+                        }
+                    return {"success": True, "messages": []}
+                base = self.paging_base
                 return {
                     "success": True,
                     "messages": [
-                        self._message("m-old", "之前有人说 DSV4F 默认输出限制是 64K", timestamp="1000"),
-                        self._message("m-new", "max_tokens 需要另外配置", timestamp="1010"),
+                        self._message("m-old", "之前有人说 DSV4F 默认输出限制是 64K", timestamp=str(base)),
+                        self._message("m-new", "max_tokens 需要另外配置", timestamp=str(base + 10)),
                     ],
                 }
             if capability == "llm.generate":
@@ -219,7 +247,9 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0].excluded_terms, ["价格"])
 
-    async def test_history_search_uses_intent_embedding_and_evidence_answer(self) -> None:
+    async def _search_and_wait_answer(self) -> str:
+        """发起寻迹命令，等待后台任务完成，返回实际发送给用户的最后一条消息。"""
+
         result = await self.instance.handle_search(
             **self._command_kwargs(
                 "/寻迹 20001 找之前讨论的输出限制",
@@ -227,7 +257,23 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
             )
         )
         self.assertTrue(result[0])
-        self.assertIn("[E1]", result[1])
+        await asyncio.gather(*tuple(self.instance._background_tasks))
+        sent_texts = [
+            str(call[2]["args"].get("text") or "")
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") == "send.text"
+        ]
+        self.assertTrue(sent_texts)
+        return sent_texts[-1]
+
+    async def test_history_search_uses_intent_embedding_and_evidence_answer(self) -> None:
+        answer = await self._search_and_wait_answer()
+        self.assertIn("[E1]", answer)
+        self.assertIn("检索说明", answer)
+        self.assertIn("DSV4F", answer)
+        # 原词与扩展命中数无论是否为零都必须显示
+        self.assertIn("原词", answer)
+        self.assertIn("扩展额外", answer)
         capabilities = [call[2].get("capability") for call in self.calls if isinstance(call[2], dict)]
         self.assertIn("message.get_by_time_in_chat", capabilities)
         self.assertIn("llm.embed", capabilities)
@@ -238,3 +284,67 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         ]
         self.assertTrue(generation_calls)
         self.assertTrue(all(call.get("model") == "utils" for call in generation_calls))
+        # 模型调用必须显式覆盖默认 30 秒 RPC 超时：
+        # rpc_timeout_ms 随能力参数传给宿主运行器
+        self.assertTrue(all(call.get("rpc_timeout_ms") == 120000 for call in generation_calls))
+        # timeout_ms 由 SDK 客户端消费并传入 RPC 层
+        llm_rpc_timeouts = [
+            call[3]
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") in ("llm.generate", "llm.embed")
+        ]
+        self.assertTrue(llm_rpc_timeouts)
+        self.assertTrue(all(timeout == 120000 for timeout in llm_rpc_timeouts))
+
+    async def test_history_search_pages_backwards_for_full_window(self) -> None:
+        config = self.instance.get_default_config()
+        self.instance.set_plugin_config(
+            {
+                **config,
+                "access": {
+                    "admin_user_ids": ["10001"],
+                    "allowed_group_ids": ["20001"],
+                    "notification_user_ids": [],
+                },
+                "retrieval": {**config["retrieval"], "max_history_messages": 100},
+            }
+        )
+        answer = await self._search_and_wait_answer()
+        fetch_calls = [
+            call
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") == "message.get_by_time_in_chat"
+        ]
+        # 第一页返回整整 100 条后应继续向回翻页，读到更早的相关消息
+        self.assertEqual(len(fetch_calls), 2)
+        self.assertIn("共扫描 102 条消息", answer)
+
+    async def test_scan_floor_prevents_rescanning_exhausted_history(self) -> None:
+        config = self.instance.get_default_config()
+        self.instance.set_plugin_config(
+            {
+                **config,
+                "access": {
+                    "admin_user_ids": ["10001"],
+                    "allowed_group_ids": ["20001"],
+                    "notification_user_ids": [],
+                },
+                # 关闭结果缓存，验证扫描水位本身能阻止重复扫描
+                "retrieval": {**config["retrieval"], "max_history_messages": 100, "answer_cache_seconds": 0},
+            }
+        )
+        await self._search_and_wait_answer()
+        await self._search_and_wait_answer()
+        fetch_calls = [
+            call
+            for call in self.calls
+            if isinstance(call[2], dict) and call[2].get("capability") == "message.get_by_time_in_chat"
+        ]
+        # 第一次查询扫描两页后已到宿主历史边界；第二次不应再发起扫描
+        self.assertEqual(len(fetch_calls), 2)
+
+    async def test_identical_query_returns_cached_answer(self) -> None:
+        first = await self._search_and_wait_answer()
+        second = await self._search_and_wait_answer()
+        self.assertNotIn("缓存结果", first)
+        self.assertIn("缓存结果", second)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
 
 import asyncio
 import hashlib
@@ -13,7 +13,8 @@ import json
 import sqlite3
 import time
 
-from .models import CompositeRule, PendingRule
+from .models import CompositeRule, MessageRecord, PendingRule
+from .rule_engine import normalize_text
 
 
 class StateStore:
@@ -67,6 +68,50 @@ class StateStore:
             occurred_at,
         )
 
+    async def index_messages(self, records: Sequence[MessageRecord]) -> int:
+        """把文本消息写入本地关键词索引，重复消息自动忽略。"""
+
+        return await asyncio.to_thread(self._index_messages_sync, list(records))
+
+    async def search_index(
+        self,
+        group_id: str,
+        terms: Sequence[str],
+        start_time: float,
+        end_time: float,
+        limit: int,
+    ) -> List[MessageRecord]:
+        """按关键词直查本地索引；terms 为空时返回时间范围内最新的消息。"""
+
+        return await asyncio.to_thread(
+            self._search_index_sync, group_id, list(terms), start_time, end_time, limit
+        )
+
+    async def index_neighbors(self, group_id: str, timestamp: float, radius: int) -> List[MessageRecord]:
+        """返回索引中某时间点前后各 radius 条消息（含该时间点本身）。"""
+
+        return await asyncio.to_thread(self._index_neighbors_sync, group_id, timestamp, radius)
+
+    async def index_coverage(self, group_id: str) -> Tuple[float, float, int] | None:
+        """返回索引对某群的覆盖情况（最早时间、最晚时间、条数），无记录时为 None。"""
+
+        return await asyncio.to_thread(self._index_coverage_sync, group_id)
+
+    async def prune_index(self, allowed_group_ids: Sequence[str], retention_days: int) -> int:
+        """删除超过保留期或已移出白名单群的索引消息。"""
+
+        return await asyncio.to_thread(self._prune_index_sync, list(allowed_group_ids), retention_days)
+
+    async def get_scanned_until(self, group_id: str) -> float | None:
+        """返回该群已经完整扫描到的最早时间水位，没有记录时为 None。"""
+
+        return await asyncio.to_thread(self._get_scanned_until_sync, group_id)
+
+    async def set_scanned_until(self, group_id: str, timestamp: float) -> None:
+        """记录扫描水位；只会往更早移动，避免反复扫描已到底的历史。"""
+
+        await asyncio.to_thread(self._set_scanned_until_sync, group_id, timestamp)
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=10)
         connection.row_factory = sqlite3.Row
@@ -117,6 +162,25 @@ class StateStore:
                     UNIQUE(rule_id, message_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_hits_rule_time ON hits(rule_id, occurred_at);
+
+                CREATE TABLE IF NOT EXISTS message_index (
+                    message_id TEXT PRIMARY KEY,
+                    stream_id TEXT NOT NULL DEFAULT '',
+                    group_id TEXT NOT NULL,
+                    group_name TEXT NOT NULL DEFAULT '',
+                    user_id TEXT NOT NULL DEFAULT '',
+                    user_name TEXT NOT NULL DEFAULT '',
+                    text TEXT NOT NULL,
+                    normalized_text TEXT NOT NULL,
+                    timestamp REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_index_group_time
+                    ON message_index(group_id, timestamp);
+
+                CREATE TABLE IF NOT EXISTS index_meta (
+                    group_id TEXT PRIMARY KEY,
+                    scanned_until REAL NOT NULL
+                );
                 """
             )
 
@@ -275,9 +339,164 @@ class StateStore:
                 )
             return True
 
+    def _index_messages_sync(self, records: List[MessageRecord]) -> int:
+        rows = []
+        for record in records:
+            text = record.text.strip()
+            if not text:
+                continue
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            message_id = record.message_id or f"{record.group_id}:{record.timestamp:.6f}:{digest}"
+            rows.append(
+                (
+                    message_id,
+                    record.stream_id,
+                    record.group_id,
+                    record.group_name,
+                    record.user_id,
+                    record.user_name,
+                    text[:4000],
+                    normalize_text(text)[:4000],
+                    record.timestamp,
+                )
+            )
+        if not rows:
+            return 0
+        with self._lock, self._connection() as connection:
+            cursor = connection.executemany(
+                """
+                INSERT OR IGNORE INTO message_index(
+                    message_id, stream_id, group_id, group_name,
+                    user_id, user_name, text, normalized_text, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return max(0, cursor.rowcount)
+
+    def _search_index_sync(
+        self,
+        group_id: str,
+        terms: List[str],
+        start_time: float,
+        end_time: float,
+        limit: int,
+    ) -> List[MessageRecord]:
+        query = (
+            "SELECT * FROM message_index WHERE group_id = ? AND timestamp >= ? AND timestamp <= ?"
+        )
+        params: List[Any] = [group_id, start_time, end_time]
+        like_clauses = []
+        for term in terms[:20]:
+            normalized = normalize_text(term)
+            if not normalized:
+                continue
+            like_clauses.append("normalized_text LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(normalized)}%")
+        if like_clauses:
+            query += " AND (" + " OR ".join(like_clauses) + ")"
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(max(1, limit))
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._message_from_row(row) for row in reversed(rows)]
+
+    def _index_neighbors_sync(self, group_id: str, timestamp: float, radius: int) -> List[MessageRecord]:
+        with self._lock, self._connection() as connection:
+            before = connection.execute(
+                """
+                SELECT * FROM message_index WHERE group_id = ? AND timestamp < ?
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (group_id, timestamp, max(0, radius)),
+            ).fetchall()
+            after = connection.execute(
+                """
+                SELECT * FROM message_index WHERE group_id = ? AND timestamp >= ?
+                ORDER BY timestamp ASC LIMIT ?
+                """,
+                (group_id, timestamp, max(0, radius) + 1),
+            ).fetchall()
+        records = [self._message_from_row(row) for row in reversed(before)]
+        records.extend(self._message_from_row(row) for row in after)
+        return records
+
+    def _index_coverage_sync(self, group_id: str) -> Tuple[float, float, int] | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest, COUNT(*) AS total
+                FROM message_index WHERE group_id = ?
+                """,
+                (group_id,),
+            ).fetchone()
+        if row is None or row["total"] in (0, None):
+            return None
+        return float(row["earliest"]), float(row["latest"]), int(row["total"])
+
+    def _prune_index_sync(self, allowed_group_ids: List[str], retention_days: int) -> int:
+        cutoff = time.time() - max(1, retention_days) * 86400
+        removed = 0
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute("DELETE FROM message_index WHERE timestamp < ?", (cutoff,))
+            removed += max(0, cursor.rowcount)
+            if allowed_group_ids:
+                placeholders = ",".join("?" for _ in allowed_group_ids)
+                cursor = connection.execute(
+                    f"DELETE FROM message_index WHERE group_id NOT IN ({placeholders})",
+                    allowed_group_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM index_meta WHERE group_id NOT IN ({placeholders})",
+                    allowed_group_ids,
+                )
+            else:
+                cursor = connection.execute("DELETE FROM message_index")
+                connection.execute("DELETE FROM index_meta")
+            removed += max(0, cursor.rowcount)
+        return removed
+
+    def _get_scanned_until_sync(self, group_id: str) -> float | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT scanned_until FROM index_meta WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+        return float(row["scanned_until"]) if row else None
+
+    def _set_scanned_until_sync(self, group_id: str, timestamp: float) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO index_meta(group_id, scanned_until) VALUES (?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                    scanned_until = MIN(index_meta.scanned_until, excluded.scanned_until)
+                """,
+                (group_id, timestamp),
+            )
+
+    @staticmethod
+    def _message_from_row(row: sqlite3.Row) -> MessageRecord:
+        return MessageRecord(
+            message_id=str(row["message_id"]),
+            stream_id=str(row["stream_id"]),
+            group_id=str(row["group_id"]),
+            group_name=str(row["group_name"]),
+            user_id=str(row["user_id"]),
+            user_name=str(row["user_name"]),
+            text=str(row["text"]),
+            timestamp=float(row["timestamp"]),
+        )
+
     @staticmethod
     def _rule_from_row(row: sqlite3.Row) -> CompositeRule:
         payload: Dict[str, Any] = json.loads(row["payload_json"])
         payload["enabled"] = bool(row["enabled"])
         payload["last_triggered_at"] = float(row["last_triggered_at"])
         return CompositeRule.from_dict(payload)
+
+
+def _escape_like(term: str) -> str:
+    """转义 LIKE 通配符，保证关键词按字面匹配。"""
+
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

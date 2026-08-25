@@ -20,7 +20,7 @@ class PluginSection(PluginConfigBase):
         json_schema_extra={"label": "启用麦麦群聊寻迹"},
     )
     config_version: str = Field(
-        default="0.1.0",
+        default="0.2.0",
         description="配置结构版本，请勿手动修改",
         json_schema_extra={"label": "配置版本", "readonly": True},
     )
@@ -106,8 +106,15 @@ class RetrievalSection(PluginConfigBase):
         default=1200,
         ge=100,
         le=10000,
-        description="单次从 MaiBot 读取的历史消息上限",
-        json_schema_extra={"label": "历史消息上限"},
+        description="单页从 MaiBot 读取的历史消息数量；插件会从最新往回分页扫描直到覆盖完整时间范围",
+        json_schema_extra={"label": "历史消息上限（单页）"},
+    )
+    scan_messages: int = Field(
+        default=12000,
+        ge=1000,
+        le=100000,
+        description="单次寻迹累计扫描的消息总数上限；高流量群建议调大，避免时间范围覆盖不全",
+        json_schema_extra={"label": "扫描消息上限"},
     )
     lexical_candidates: int = Field(
         default=100,
@@ -134,6 +141,25 @@ class RetrievalSection(PluginConfigBase):
         default=True,
         description="使用 MaiBot 已有嵌入任务进行语义重排；失败时保留本地检索结果",
         json_schema_extra={"label": "启用嵌入语义检索"},
+    )
+    local_index_enabled: bool = Field(
+        default=True,
+        description="把白名单群的文本消息写入插件本地索引，寻迹时按关键词直查；索引未覆盖的更早时段自动扫描补齐",
+        json_schema_extra={"label": "启用本地关键词索引"},
+    )
+    index_retention_days: int = Field(
+        default=180,
+        ge=7,
+        le=730,
+        description="本地索引保留天数；超期消息和移出白名单群的消息会被自动清理",
+        json_schema_extra={"label": "索引保留天数"},
+    )
+    answer_cache_seconds: int = Field(
+        default=600,
+        ge=0,
+        le=86400,
+        description="相同群聊和相同线索的寻迹结果缓存时长；期间重复查询直接返回缓存，0 表示关闭",
+        json_schema_extra={"label": "相同查询缓存（秒）"},
     )
 
 
@@ -165,6 +191,13 @@ class ModelSection(PluginConfigBase):
         le=1.0,
         description="规则解析和事实回答温度，较低更稳定",
         json_schema_extra={"label": "模型温度"},
+    )
+    llm_timeout_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=600,
+        description="单次模型调用的 RPC 等待时间；慢渠道响应超过默认 30 秒会被宿主中断，此处覆盖该上限",
+        json_schema_extra={"label": "模型等待时间（秒）"},
     )
 
 
