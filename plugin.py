@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from asyncio import Semaphore
+from datetime import datetime
 from time import time
 from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple, cast
 
@@ -331,6 +332,17 @@ class GroupTracePlugin(MaiBotPlugin):
             filter_command=True,
         )
         messages = normalize_messages(raw_messages)
+        if not messages:
+            return f"这个群最近 {plan.history_days} 天没有可供查询的文本消息。"
+
+        keyword_text = "、".join(plan.keywords[:8]) if plan.keywords else "（按原文匹配）"
+        scope_note = (
+            f"\n\n检索说明：理解关键词 {keyword_text}；实际检索 {len(messages)} 条文本消息"
+            f"（{_format_time(messages[0].timestamp)} 至 {_format_time(messages[-1].timestamp)}）。"
+        )
+        if _raw_message_count(raw_messages) >= config.retrieval.max_history_messages:
+            scope_note += "已达单次读取上限，更早的消息未纳入本次检索；可在插件设置中调大“历史消息上限”。"
+
         if plan.excluded_terms:
             messages = [
                 message
@@ -338,9 +350,10 @@ class GroupTracePlugin(MaiBotPlugin):
                 if not any(normalize_text(term) in normalize_text(message.text) for term in plan.excluded_terms)
             ]
         if not messages:
-            return f"这个群最近 {plan.history_days} 天没有可供查询的文本消息。"
+            return f"排除“{'、'.join(plan.excluded_terms)}”后，这个群没有剩余可查询的文本消息。{scope_note}"
 
-        retrieval_query = " ".join([plan.search_query, *plan.keywords]).strip()
+        # 用户原文始终参与检索，模型理解结果只能补充召回、不能替换原始线索。
+        retrieval_query = " ".join([original_query, plan.search_query, *plan.keywords]).strip()
         candidates = rank_lexically(retrieval_query, messages, config.retrieval.lexical_candidates)
         seed_limit = max(
             3,
@@ -370,7 +383,7 @@ class GroupTracePlugin(MaiBotPlugin):
         group_name = evidence[0].group_name if evidence else f"群聊{group_id}"
         search_results = await self._search_external(plan.search_query)
         if not evidence and not search_results:
-            return f"没有在“{group_name}”最近 {plan.history_days} 天的记录中找到足够相关的证据。{plan_note}"
+            return f"没有在“{group_name}”最近 {plan.history_days} 天的记录中找到足够相关的证据。{scope_note}{plan_note}"
 
         prompt = build_answer_prompt(original_query, group_name, evidence, search_results)
         result = await self._generate(prompt, self._config().models.verify_task, max_tokens=2400)
@@ -382,7 +395,7 @@ class GroupTracePlugin(MaiBotPlugin):
             answer += "\n\n外部资料链接：\n" + "\n".join(
                 f"- {item.title}：{item.url}" for item in search_results
             )
-        return (answer + plan_note)[:14000]
+        return (answer + scope_note + plan_note)[:14000]
 
     async def _semantic_verify(self, rule: CompositeRule, evidence: Sequence[MessageRecord]) -> bool:
         prompt = build_semantic_verify_prompt(rule, evidence)
@@ -538,6 +551,16 @@ class GroupTracePlugin(MaiBotPlugin):
 
 def _normalize_numeric_ids(values: Sequence[str]) -> Set[str]:
     return {str(value).strip() for value in values if str(value).strip().isdigit()}
+
+
+def _raw_message_count(raw_messages: Any) -> int:
+    if isinstance(raw_messages, Mapping):
+        raw_messages = raw_messages.get("messages") or raw_messages.get("items") or []
+    return len(raw_messages) if isinstance(raw_messages, list) else 0
+
+
+def _format_time(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
 
 
 def create_plugin() -> GroupTracePlugin:

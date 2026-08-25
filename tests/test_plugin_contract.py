@@ -228,6 +228,8 @@ class PluginLifecycleTests(IsolatedAsyncioTestCase):
         )
         self.assertTrue(result[0])
         self.assertIn("[E1]", result[1])
+        self.assertIn("检索说明", result[1])
+        self.assertIn("DSV4F", result[1])
         capabilities = [call[2].get("capability") for call in self.calls if isinstance(call[2], dict)]
         self.assertIn("message.get_by_time_in_chat", capabilities)
         self.assertIn("llm.embed", capabilities)

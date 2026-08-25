@@ -11,6 +11,7 @@ import time
 import uuid
 
 from .models import CompositeRule, QueryPlan
+from .rule_engine import normalize_text
 
 GenerateFn = Callable[[str], Awaitable[Dict[str, Any]]]
 
@@ -55,7 +56,14 @@ class RuleIntentParser:
         payload = extract_json_object(str(result.get("response") or ""))
         search_query = str(payload.get("search_query") or description).strip()[:2000]
         keywords = _string_list(payload.get("keywords"))[:30]
-        excluded_terms = _string_list(payload.get("excluded_terms"))[:30]
+        # 排除词必须在用户原话中出现过才生效，防止模型自行编造排除条件、
+        # 在排序前静默删掉相关消息。
+        normalized_description = normalize_text(description)
+        excluded_terms = [
+            term
+            for term in _string_list(payload.get("excluded_terms"))[:30]
+            if normalize_text(term) in normalized_description
+        ]
         try:
             history_days = int(payload.get("history_days", default_history_days))
         except (TypeError, ValueError):
